@@ -117,11 +117,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     private func resolveRepoRoot() -> String? {
         let bundlePath = Bundle.main.bundlePath
-        let candidates = [
-            Bundle.main.resourcePath.map { "\($0)/app" },
-            URL(fileURLWithPath: bundlePath).deletingLastPathComponent().deletingLastPathComponent().path,
-            FileManager.default.currentDirectoryPath
-        ].compactMap { $0 }
+        var candidates: [String] = []
+        if let res = Bundle.main.resourcePath {
+            candidates.append("\(res)/app")
+        }
+        candidates.append(URL(fileURLWithPath: bundlePath).deletingLastPathComponent().deletingLastPathComponent().path)
+        candidates.append(FileManager.default.currentDirectoryPath)
 
         return candidates.first(where: { FileManager.default.fileExists(atPath: "\($0)/server/index.mjs") })
     }
