@@ -5,11 +5,12 @@
 
 import { spawn, execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { resolvePython, SCRATCH_DIR, TTS_CACHE_DIR } from "./config.mjs";
 import { redact } from "./redact.mjs";
 import { speechify, summarizeForSpeech } from "./speechPrep.mjs";
+import { getGeminiKeys, synthesizeGeminiLiveVoice } from "./geminiPool.mjs";
 
 export const PROGRESS_PING_PHRASES = [
   "Kaam chal raha hai, check kar raha hoon...",
@@ -69,10 +70,15 @@ export async function detectEngines(log) {
       ? `edge_tts (${versionOut}) importable via ${pyBin}`
       : `${pyBin} present but edge_tts missing (pip install edge-tts)`;
   }
+  const geminiKeys = getGeminiKeys();
   const engines = {
+    gemini: {
+      available: geminiKeys.length > 0,
+      detail: `Gemini 3.8 Flash Live Voice (Kore) via ${geminiKeys.length}-key round-robin pool`,
+      cost: `${geminiKeys.length}-key rotating pool (free tier)`,
+    },
     edge: { available: edge, detail: edgeDetail, pythonPath: pyBin, cost: "free, unlimited" },
     say: { available: sayBin, detail: sayBin ? "macOS `say` available (Rishi/Lekha)" : "macOS `say` not found (non-mac host)", cost: "free" },
-    gemini: { available: false, detail: "deliberately not wired: ~10 req/day/key cap (LIMITATIONS L-3)", cost: "free tier capped" },
   };
   log?.info("tts", `engines: edge=${engines.edge.available} say=${engines.say.available} (${engines.edge.detail})`);
   return engines;
@@ -130,6 +136,28 @@ export async function synthesize({ text, voice = "hi-IN-MadhurNeural", rate = "+
     const t0 = Date.now();
     const normalizedRate = typeof rate === "number" ? `${rate >= 1 ? "+" : ""}${Math.round((rate - 1) * 100)}%` : String(rate || "+0%");
     const hash = cacheKey(engine, voice, normalizedRate, safe);
+
+    // 0. Primary Premium: Gemini 3.8 Flash Live Voice (Kore) with 20-Key Auto-Rotation
+    if (engine === "gemini" || engine === "auto" || engine === "kriti") {
+      const cachedGeminiWav = join(TTS_CACHE_DIR, `hv-gemini-${hash}.wav`);
+      const scratchGeminiWav = join(SCRATCH_DIR, `hv-gemini-${hash}.wav`);
+      if (existsSync(cachedGeminiWav) && statSync(cachedGeminiWav).size > 512) {
+        if (!existsSync(scratchGeminiWav)) copyFileSync(cachedGeminiWav, scratchGeminiWav);
+        return { ...ok(scratchGeminiWav, "gemini", "audio/wav", t0, safe), cached: true };
+      }
+
+      try {
+        const voiceName = voice.toLowerCase().includes("puck") ? "Puck" : "Kore";
+        const wavBuffer = await synthesizeGeminiLiveVoice(safe, voiceName, log);
+        if (wavBuffer && wavBuffer.length > 512) {
+          writeFileSync(cachedGeminiWav, wavBuffer);
+          copyFileSync(cachedGeminiWav, scratchGeminiWav);
+          return { ...ok(scratchGeminiWav, "gemini", "audio/wav", t0, safe), cached: false };
+        }
+      } catch (e) {
+        log?.warn("tts", `Gemini 20-key pool failed (${e.message}) — auto-falling back to Edge TTS`);
+      }
+    }
 
     // 1. Check Edge TTS cache first
     if (engine === "edge" || engine === "auto") {

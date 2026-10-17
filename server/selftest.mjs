@@ -292,14 +292,14 @@ test("store", "session retention prunes beyond 100 / 30 days", (t) => {
   }
 });
 
-test("tts", "engine detection reports honestly and never claims Gemini", async (t) => {
+test("tts", "engine detection reports honestly with gemini 20-key pool support", async (t) => {
   ensureDirs();
   t.true(existsSync(TTS_CACHE_DIR), "tts-cache directory exists");
   t.true(Boolean(resolvePython()), "python runtime resolved");
   const engines = await detectEngines(null);
   t.eq(typeof engines.edge.available, "boolean", "edge probed, not assumed");
   t.eq(typeof engines.say.available, "boolean", "say probed, not assumed");
-  t.eq(engines.gemini.available, false, "gemini deliberately unwired (daily cap)");
+  t.eq(typeof engines.gemini.available, "boolean", "gemini pool probed, not assumed");
   t.has(engines.edge.detail, engines.edge.available ? "importable" : "missing", "detail explains the probe result");
 });
 
