@@ -517,13 +517,28 @@ export function useHermesVoice() {
         setState("idle", "empty transcript");
         return;
       }
+
+      let cleanText = text.trim();
+      // Clean wake-word prefix ("Hey Kriti" / "Kriti")
+      const wakeMatch = cleanText.match(/^(?:hey\s+)?(?:kriti|kreeti|कृति)[,\s]*/i);
+      if (wakeMatch) {
+        cleanText = cleanText.slice(wakeMatch[0].length).trim();
+        if (!cleanText) {
+          setState("speaking", "wake word greeted");
+          void speak("Haan boliye, main sun rahi hoon.", "high").then(() => {
+            void startListening();
+          });
+          return;
+        }
+      }
+
       setState("transcribing", "stt finalizing");
-      logger.info("stt", `final "${redact(text)}" conf=${confidence.toFixed(2)}`);
+      logger.info("stt", `final "${redact(cleanText)}" conf=${confidence.toFixed(2)}`);
 
       if (confidence < s.confidenceThreshold) {
-        setPendingConfirm({ text, confidence });
+        setPendingConfirm({ text: cleanText, confidence });
         setState("confirmingTranscript", "low confidence");
-        void speak(confirmTranscriptPrompt(text, s.lang), "high");
+        void speak(confirmTranscriptPrompt(cleanText, s.lang), "high");
         if (confirmTimer.current) window.clearTimeout(confirmTimer.current);
         confirmTimer.current = window.setTimeout(() => {
           setPendingConfirm((p) => {
@@ -537,7 +552,7 @@ export function useHermesVoice() {
         }, 15000);
         return;
       }
-      void runAgent(text, confidence, durationMs);
+      void runAgent(cleanText, confidence, durationMs);
     },
     [push, runAgent, setState, speak],
   );

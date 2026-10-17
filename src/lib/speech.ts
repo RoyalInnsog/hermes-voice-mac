@@ -232,8 +232,25 @@ export class WebSTTEngine {
   /** Mic level meter — with High-Pass Filter (<280Hz) to kill cooler motor hum & adaptive noise gate. */
   private async startMeter(onLevel: (rms: number) => void) {
     try {
+      let preferredDeviceId: string | undefined;
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        // ALWAYS prefer MacBook Built-in / Internal microphone over Bluetooth headsets
+        const builtIn = devices.find(
+          (d) =>
+            d.kind === "audioinput" &&
+            (d.label.toLowerCase().includes("macbook") ||
+              d.label.toLowerCase().includes("built-in") ||
+              d.label.toLowerCase().includes("internal")),
+        );
+        if (builtIn) preferredDeviceId = builtIn.deviceId;
+      } catch {
+        /* ignore */
+      }
+
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: {
+          ...(preferredDeviceId ? { deviceId: { exact: preferredDeviceId } } : {}),
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,

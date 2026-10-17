@@ -50,6 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        forceBuiltInMicrophone()
         ensureBridgeRunning()
         setupStatusItem()
         setupFloatingPanel()
@@ -110,6 +111,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         var error: NSDictionary?
         if let script = NSAppleScript(source: "set volume output volume \(clamped)") {
             _ = script.executeAndReturnError(&error)
+        }
+    }
+
+    // MARK: - Force MacBook Pro Built-in Microphone
+    private func forceBuiltInMicrophone() {
+        var propSize: UInt32 = 0
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &propSize) == noErr else { return }
+        let deviceCount = Int(propSize) / MemoryLayout<AudioDeviceID>.size
+        var deviceIDs = [AudioDeviceID](repeating: 0, count: deviceCount)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &propSize, &deviceIDs) == noErr else { return }
+
+        for devID in deviceIDs {
+            var nameSize: UInt32 = 256
+            var name: CFString = "" as CFString
+            var devNameAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioObjectPropertyName,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            withUnsafeMutablePointer(to: &name) { ptr in
+                _ = AudioObjectGetPropertyData(devID, &devNameAddress, 0, nil, &nameSize, ptr)
+            }
+
+            var inputScopeAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyStreams,
+                mScope: kAudioDevicePropertyScopeInput,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var streamSize: UInt32 = 0
+            AudioObjectGetPropertyDataSize(devID, &inputScopeAddress, 0, nil, &streamSize)
+
+            if streamSize > 0 {
+                let devNameStr = String(name)
+                if devNameStr.contains("MacBook") || devNameStr.contains("Built-in") || devNameStr.contains("Internal") {
+                    var setAddress = AudioObjectPropertyAddress(
+                        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+                        mScope: kAudioObjectPropertyScopeGlobal,
+                        mElement: kAudioObjectPropertyElementMain
+                    )
+                    var targetID = devID
+                    let status = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &setAddress, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &targetID)
+                    if status == noErr {
+                        NSLog("[HermesVoice] Pinned system input device to: %@", devNameStr)
+                    }
+                    break
+                }
+            }
         }
     }
 
