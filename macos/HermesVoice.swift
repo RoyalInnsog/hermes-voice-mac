@@ -117,10 +117,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     private func resolveRepoRoot() -> String? {
         let bundlePath = Bundle.main.bundlePath
+        let home = NSHomeDirectory()
         var candidates: [String] = []
         if let res = Bundle.main.resourcePath {
             candidates.append("\(res)/app")
         }
+        candidates.append("\(home)/Documents/Projects/hermes-voice-mac")
         candidates.append(URL(fileURLWithPath: bundlePath).deletingLastPathComponent().deletingLastPathComponent().path)
         candidates.append(FileManager.default.currentDirectoryPath)
 
@@ -149,7 +151,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     private func spawnBridgeProcess() {
         guard let repoRoot = resolveRepoRoot() else { return }
 
+        let home = NSHomeDirectory()
         let nodeCandidates = [
+            "\(home)/.hermes/tools/node-26.7.0-darwin-arm64/bin/node",
+            "\(home)/.hermes/node/bin/node",
+            "\(home)/.local/bin/node",
             "/opt/homebrew/bin/node",
             "/usr/local/bin/node",
             "/usr/bin/node"
@@ -158,6 +164,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
         let proc = Process()
         proc.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
+
+        var env = ProcessInfo.processInfo.environment
+        let extraPaths = [
+            "\(home)/.hermes/tools/node-26.7.0-darwin-arm64/bin",
+            "\(home)/.hermes/node/bin",
+            "\(home)/.hermes/hermes-agent/.hermes/bin",
+            "\(home)/.hermes/hermes-agent/venv/bin",
+            "\(home)/.local/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin"
+        ].joined(separator: ":")
+        env["PATH"] = "\(extraPaths):" + (env["PATH"] ?? "")
+        env["HV_PORT"] = "20130"
+        proc.environment = env
+
         if nodeBin == "/usr/bin/env" {
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             proc.arguments = ["node", "server/index.mjs"]
@@ -167,7 +190,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         }
         try? proc.run()
         self.bridgeProcess = proc
-        Thread.sleep(forTimeInterval: 0.45)
+        Thread.sleep(forTimeInterval: 1.0)
     }
 
     // MARK: - 3. Status Bar Menu & Right-Click / Left-Click Polish
@@ -324,6 +347,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         }
         """
         webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        NSLog("[HermesVoice] Provisional navigation failed: \(error.localizedDescription). Retrying in 1.2s...")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self = self else { return }
+            self.ensureBridgeRunning()
+            self.webView.load(URLRequest(url: self.bridgeURL))
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        NSLog("[HermesVoice] Navigation failed: \(error.localizedDescription). Retrying in 1.2s...")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self = self else { return }
+            self.ensureBridgeRunning()
+            self.webView.load(URLRequest(url: self.bridgeURL))
+        }
     }
 
     // Grant microphone capture inside WKWebView on macOS 12+

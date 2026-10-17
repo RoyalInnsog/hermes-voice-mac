@@ -84,7 +84,7 @@ const defaults = {
   hermes: {
     // argvTemplate may name a launcher (e.g. node + fake-hermes.mjs) for testing
     command: ["hermes"],
-    argvTemplate: ["chat", "-q", "{{utterance}}", "--format", "stream-json", "--session", "{{sessionId}}"],
+    argvTemplate: ["chat", "-q", "{{utterance}}", "--format", "stream-json"],
     cwd: join(homedir(), ".hermes"),
     timeoutSec: 300,
     pathHint: DEFAULT_HERMES_PATHS,

@@ -461,8 +461,13 @@ export class TaskManager {
     if (task.pingInterval) clearInterval(task.pingInterval);
     this.#clearPending(task);
     task.finishedAt = Date.now();
-    if (!["done", "failed", "cancelled"].includes(task.status)) {
+    const completedEvt = task.events.find((e) => e.type === "completed");
+    if (completedEvt) {
+      task.status = "done";
+      task.summary = completedEvt.payload.text;
+    } else if (!["done", "failed", "cancelled"].includes(task.status)) {
       task.status = task.events.some((e) => e.type === "failed") ? "failed" : "done";
+      task.summary = task.plain.join("\n").trim() || (task.status === "done" ? "Task completed." : "Task failed.");
     }
     this.#emit(task, "exit", { status: task.status, durationMs: task.finishedAt - task.startedAt });
     this.#recordUtterance(task, null); // flush session
@@ -532,6 +537,7 @@ export class TaskManager {
       sessionId: task.sessionId,
       model: task.model,
       status: task.status,
+      summary: task.summary ?? null,
       utterance: task.utterance,
       startedAt: task.startedAt,
       finishedAt: task.finishedAt,
