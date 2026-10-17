@@ -82,6 +82,7 @@ export function useHermesVoice() {
 
   const [partial, setPartial] = useState("");
   const [level, setLevel] = useState(0);
+  const [outputLevel, setOutputLevel] = useState(0);
   const [timeline, setTimeline] = useState<TimelineItem[]>([]);
   const [pending, setPending] = useState<PermissionRequest | null>(null);
   const [pendingRemaining, setPendingRemaining] = useState(0);
@@ -138,37 +139,68 @@ export function useHermesVoice() {
     return true;
   }, []);
 
+  /** Instant barge-in (Spec §2.4): halts ongoing TTS playback immediately. */
+  const bargeIn = useCallback(() => {
+    if (audioEl.current) {
+      try {
+        audioEl.current.pause();
+        audioEl.current.currentTime = 0;
+      } catch {
+        /* ignore */
+      }
+    }
+    tts.current?.stop();
+    setSpeakingNow(false);
+    setOutputLevel(0);
+    if (stateRef.current === "speaking") {
+      setState("idle", "barge-in interrupted speech");
+    }
+  }, [setState]);
+
   /** Speak via the bridge's Edge TTS when available; otherwise the system voice. */
-  const playBridgeAudio = useCallback(async (text: string): Promise<boolean> => {
-    const s = settingsRef.current;
-    if (!s.useBridgeTTS || !backend.reachable) return false;
-    try {
-      const res = await clientRef.current.tts(text, s.ttsEngine === "edgeTTS" ? undefined : undefined);
-      if (!res.ok) {
-        logger.warn("tts", `bridge tts refused: ${res.message ?? res.error} (${res.hint ?? "no hint"})`);
+  const playBridgeAudio = useCallback(
+    async (text: string): Promise<boolean> => {
+      const s = settingsRef.current;
+      if (!s.useBridgeTTS || !backend.reachable) return false;
+      try {
+        const res = await clientRef.current.tts(text, s.ttsEngine === "edgeTTS" ? undefined : undefined);
+        if (!res.ok) {
+          logger.warn("tts", `bridge tts refused: ${res.message ?? res.error} (${res.hint ?? "no hint"})`);
+          return false;
+        }
+        const url = s.bridgeURL.replace(/\/+$/, "") + res.url;
+        const el = audioEl.current ?? new Audio();
+        audioEl.current = el;
+        el.src = url;
+        el.volume = s.ttsVolume;
+        setSpeakingNow(true);
+        const pulseId = window.setInterval(() => {
+          setOutputLevel(0.22 + Math.random() * 0.55);
+        }, 65);
+        try {
+          await el.play();
+          await new Promise<void>((r) => {
+            el.onended = () => r();
+            el.onerror = () => r();
+            el.onpause = () => r();
+            setTimeout(r, 45000);
+          });
+        } finally {
+          window.clearInterval(pulseId);
+          setOutputLevel(0);
+          setSpeakingNow(false);
+        }
+        logger.info("tts", `played ${res.bytes}B from bridge engine=${res.engine} in ${res.ms}ms`);
+        return true;
+      } catch (e) {
+        setOutputLevel(0);
+        setSpeakingNow(false);
+        logger.warn("tts", `bridge audio playback failed: ${e instanceof Error ? e.message : String(e)}`);
         return false;
       }
-      const url = s.bridgeURL.replace(/\/+$/, "") + res.url;
-      const el = audioEl.current ?? new Audio();
-      audioEl.current = el;
-      el.src = url;
-      el.volume = s.ttsVolume;
-      setSpeakingNow(true);
-      await el.play();
-      await new Promise<void>((r) => {
-        el.onended = () => r();
-        el.onerror = () => r();
-        setTimeout(r, 45000);
-      });
-      setSpeakingNow(false);
-      logger.info("tts", `played ${res.bytes}B from bridge engine=${res.engine} in ${res.ms}ms`);
-      return true;
-    } catch (e) {
-      setSpeakingNow(false);
-      logger.warn("tts", `bridge audio playback failed: ${e instanceof Error ? e.message : String(e)}`);
-      return false;
-    }
-  }, [backend.reachable]);
+    },
+    [backend.reachable],
+  );
 
   const speak = useCallback(
     async (text: string, priority: "low" | "normal" | "high" = "normal") => {
@@ -189,7 +221,9 @@ export function useHermesVoice() {
         pitch: s.ttsPitch,
         volume: s.ttsVolume,
         voiceURI: s.ttsVoiceURI,
+        onBoundaryLevel: (lv) => setOutputLevel(lv),
       });
+      setOutputLevel(0);
       setSpeakingNow(false);
     },
     [playBridgeAudio],
@@ -485,6 +519,8 @@ export function useHermesVoice() {
   const startListening = useCallback(async () => {
     const s = settingsRef.current;
     if (stateRef.current === "listening") return;
+    // Barge-in: immediately interrupt ongoing TTS audio playback when user taps mic / presses hotkey
+    bargeIn();
     if (!sttSupported) {
       raise("sttUnsupported");
       return;
@@ -493,9 +529,6 @@ export function useHermesVoice() {
     setActiveError(null);
     setPartial("");
     listenStart.current = Date.now();
-    tts.current?.stop();
-    audioEl.current?.pause();
-    setSpeakingNow(false);
 
     if (maxLenTimer.current) window.clearTimeout(maxLenTimer.current);
     maxLenTimer.current = window.setTimeout(() => {
@@ -518,7 +551,7 @@ export function useHermesVoice() {
         setState("idle", "stt error");
       },
     });
-  }, [finalizeTranscript, push, raise, setState, speak, sttSupported]);
+  }, [bargeIn, finalizeTranscript, push, raise, setState, speak, sttSupported]);
 
   const stopListening = useCallback(() => {
     if (stateRef.current !== "listening") return;
@@ -877,11 +910,20 @@ export function useHermesVoice() {
         stopListening();
       }
     };
+    const onNativeGlobalHotkey = () => {
+      if (stateRef.current === "listening") {
+        stopListening();
+      } else {
+        void startListening();
+      }
+    };
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("hv-global-hotkey", onNativeGlobalHotkey);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("hv-global-hotkey", onNativeGlobalHotkey);
     };
   }, [cancel, pending, repeatLast, resolvePermission, startListening, stopListening]);
 
@@ -895,6 +937,23 @@ export function useHermesVoice() {
     return "green";
   }, [backend.reachable, health]);
 
+  const activeModel = useMemo(() => {
+    return (
+      backend.health?.tasks.activeModel ||
+      backend.health?.omniroute.activeCombo ||
+      combos.combos[0]?.name ||
+      "KRITI / 9Router"
+    );
+  }, [backend.health, combos.combos]);
+
+  const ttsStatusLabel = useMemo(() => {
+    const edge = backend.health?.tts.engines.edge;
+    const say = backend.health?.tts.engines.say;
+    if (edge?.available) return `Edge TTS ${edge.version ?? "7.3.1"} · hi-IN-MadhurNeural`;
+    if (say?.available) return "macOS say · Rishi";
+    return ttsSupported ? "WebSpeech · en-IN" : "TTS unavailable";
+  }, [backend.health, ttsSupported]);
+
   const update = useCallback(<K extends keyof Settings>(key: K, value: Settings[K]) => {
     setSettings((prev) => ({ ...prev, [key]: value }));
   }, []);
@@ -903,6 +962,10 @@ export function useHermesVoice() {
     state,
     partial,
     level,
+    outputLevel,
+    activeModel,
+    ttsStatusLabel,
+    bargeIn,
     timeline,
     pending,
     pendingRemaining,

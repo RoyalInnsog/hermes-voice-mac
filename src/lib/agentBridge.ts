@@ -111,6 +111,53 @@ export function parseHermesLine(line: string, taskID: string): ParsedLine | null
     }
   }
 
+  // Hermes CLI `--format stream-json` line-delimited JSON chunks (v1.0)
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    try {
+      const o = JSON.parse(trimmed) as Record<string, unknown>;
+      if (o && typeof o.type === "string") {
+        if (o.type === "system") {
+          return {
+            type: "progress",
+            text: `Hermes init (${String(o.model ?? "KRITI / 9Router")})`,
+          };
+        }
+        if (o.type === "text") {
+          return { type: "progress", text: String(o.text ?? "") };
+        }
+        if (o.type === "tool_call") {
+          const toolName = String(o.name ?? o.tool ?? "unknown_tool");
+          const rawArgs = (o.arguments ?? o.args ?? {}) as Record<string, string>;
+          const args = Object.fromEntries(
+            Object.entries(rawArgs).map(([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)]),
+          );
+          const classified = classifyRisk(toolName, args);
+          return {
+            type: "permission",
+            request: {
+              id: String(o.id ?? uid()),
+              taskID,
+              toolName,
+              args,
+              risk: classified.risk,
+              reason: o.reason ? String(o.reason) : classified.note,
+              requestedAt: Date.now(),
+              expiresAt: 0,
+            },
+          };
+        }
+        if (o.type === "result") {
+          const code = typeof o.exit_code === "number" ? o.exit_code : 0;
+          return code === 0
+            ? { type: "event", event: { kind: "completed", taskID, text: String(o.text ?? "") } }
+            : { type: "event", event: { kind: "failed", taskID, reason: String(o.error ?? o.text ?? `exit ${code}`) } };
+        }
+      }
+    } catch {
+      /* fall through to plain text */
+    }
+  }
+
   return { type: "plain", text: trimmed };
 }
 
@@ -119,8 +166,9 @@ export function encodeDecision(req: PermissionRequest, decision: ApprovalDecisio
   return `HV_DECISION: ${JSON.stringify({ id: req.id, decision })}\n`;
 }
 
-/** Exact argv the native build uses. TODO-VERIFY against `hermes chat --help`. */
-export function buildHermesArgv(opts: { utterance: string; sessionId: string }): string[] {
+/** Exact argv for Hermes CLI. Supports both stream-json (v1.0) and session flag. */
+export function buildHermesArgv(opts: { utterance: string; sessionId: string; streamJson?: boolean }): string[] {
+  if (opts.streamJson) return ["chat", "-q", opts.utterance, "--format", "stream-json"];
   return ["chat", "-q", opts.utterance, "--session", opts.sessionId];
 }
 

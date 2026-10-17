@@ -15,13 +15,22 @@ export interface BridgeServerHealth {
   uptimeSec: number;
   pid: number;
   dataDir: string;
+  staticBundleReady?: boolean;
+  python?: { bin: string; source: string; verifiedVenv: boolean; candidates?: string[] };
   hermes: { found: boolean; path?: string; detail: string; command: string[]; argvTemplate: string[]; cwd: string; timeoutSec: number };
-  omniroute: HealthStatus & { baseURL: string; probeModel: string; path?: string | null; status?: number | null };
+  omniroute: HealthStatus & {
+    baseURL: string;
+    probeModel: string;
+    activeCombo?: string;
+    path?: string | null;
+    status?: number | null;
+    sqlite?: { available: boolean; path: string; combosCount: number; providersCount: number };
+  };
   tts: {
-    engines: Record<string, { available: boolean; detail: string; cost: string }>;
+    engines: Record<string, { available: boolean; detail: string; cost: string; pythonBin?: string; version?: string | null }>;
     configured: { engine: string; voice: string; rate: string };
   };
-  tasks: { live: number; total: number; cap: number; awaitingPermission: number };
+  tasks: { live: number; total: number; cap: number; awaitingPermission: number; activeModel?: string };
   permissions: { timeoutSec: number; autoApproveLowRisk: boolean };
   logging: { level: string; redact: boolean };
   protocol: Record<string, unknown>;
@@ -182,6 +191,7 @@ export class BridgeClient {
 
 export type ServerEvent =
   | { seq: number; at: number; taskId: string; type: "thinking"; payload: Record<string, never> }
+  | { seq: number; at: number; taskId: string; type: "status"; payload: { subtype: string; model: string; sessionId: string } }
   | { seq: number; at: number; taskId: string; type: "progress"; payload: { text: string; raw?: boolean; parseError?: boolean; warning?: boolean } }
   | { seq: number; at: number; taskId: string; type: "toolCall"; payload: { name: string; args: Record<string, string> } }
   | { seq: number; at: number; taskId: string; type: "permissionRequest"; payload: { request: PermissionRequest & { timeoutSec?: number } } }
@@ -226,6 +236,13 @@ export class LocalBridge implements AgentBridge {
         switch (evt.type) {
           case "thinking":
             ctx.onEvent({ kind: "thinking", taskID: task.id });
+            break;
+          case "status":
+            ctx.onEvent({
+              kind: "progress",
+              taskID: task.id,
+              text: `Model active: ${evt.payload.model} (session ${evt.payload.sessionId.slice(0, 8)})`,
+            });
             break;
           case "progress":
             ctx.onEvent({ kind: "progress", taskID: task.id, text: evt.payload.text });

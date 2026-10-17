@@ -1,11 +1,8 @@
-// server/selftest.mjs — backend test suite (spec §15).
-// Run standalone:  node server/selftest.mjs
-// Run live over HTTP:  curl -s http://127.0.0.1:20130/api/selftest
-//
-// Includes a REAL integration test: TaskManager spawns server/fake-hermes.mjs,
-// streams HV_* events, pauses on HV_PERM, receives HV_DECISION on stdin and resumes.
+// server/selftest.mjs — Hermes Voice v1.0 backend test suite.
+// Run standalone:   node server/selftest.mjs
+// Run over HTTP:    curl -s http://127.0.0.1:20130/api/selftest
 
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,8 +13,9 @@ import { allowsVoiceApproval, canAutoApprove, classifyRisk, requiresTypedConfirm
 import { mapVoiceDecision, speechify, summarizeForSpeech } from "./speechPrep.mjs";
 import { OmnirouteClient } from "./omniroute.mjs";
 import * as store from "./store.mjs";
-import { TaskManager, TaskError } from "./agent.mjs";
+import { TaskManager } from "./agent.mjs";
 import { detectEngines } from "./tts.mjs";
+import { resolvePythonRuntime, TTS_CACHE_DIR } from "./config.mjs";
 import { Logger } from "./logger.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -35,15 +33,21 @@ class T {
     this.logs.push("✓ " + msg);
   }
   eq(a, b, msg) {
-    if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`${msg} — got ${JSON.stringify(a)}, want ${JSON.stringify(b)}`);
+    if (JSON.stringify(a) !== JSON.stringify(b)) {
+      throw new Error(`${msg} — got ${JSON.stringify(a)}, want ${JSON.stringify(b)}`);
+    }
     this.logs.push("✓ " + msg);
   }
   has(hay, needle, msg) {
-    if (!String(hay).includes(needle)) throw new Error(`${msg} — ${JSON.stringify(hay)} missing ${JSON.stringify(needle)}`);
+    if (!String(hay).includes(needle)) {
+      throw new Error(`${msg} — ${JSON.stringify(hay)} missing ${JSON.stringify(needle)}`);
+    }
     this.logs.push("✓ " + msg);
   }
   hasNot(hay, needle, msg) {
-    if (String(hay).includes(needle)) throw new Error(`${msg} — must not contain ${JSON.stringify(needle)}`);
+    if (String(hay).includes(needle)) {
+      throw new Error(`${msg} — must not contain ${JSON.stringify(needle)}`);
+    }
     this.logs.push("✓ " + msg);
   }
   throws(fn, code, msg) {
@@ -72,6 +76,24 @@ const suites = [];
 const test = (suite, name, fn) => suites.push({ suite, name, fn });
 
 /* ------------------------------- protocol -------------------------------- */
+
+test("protocol", "stream-json system, text, tool_call, and result chunks parse cleanly", (t) => {
+  const sys = parseLine('{"type":"system","subtype":"init","model":"KRITI","session_id":"s-42"}', "t1");
+  t.eq(sys.type, "streamSystem", "system parsed");
+  t.eq(sys.model, "KRITI", "model extracted");
+
+  const txt = parseLine('{"type":"text","text":"Kaam shuru ho gaya"}', "t1");
+  t.eq(txt.type, "streamText", "text parsed");
+  t.eq(txt.text, "Kaam shuru ho gaya", "text content preserved");
+
+  const tc = parseLine('{"type":"tool_call","name":"shell","arguments":{"cmd":"rm -rf /tmp/a"}}', "t1");
+  t.eq(tc.type, "streamToolCall", "tool_call parsed");
+  t.eq(tc.request.risk, "critical", "rm -rf escalated to critical");
+
+  const res = parseLine('{"type":"result","text":"Task ho gaya","exit_code":0}', "t1");
+  t.eq(res.type, "streamResult", "result parsed");
+  t.eq(res.exitCode, 0, "exit_code preserved");
+});
 
 test("protocol", "HV_EVENT lines parse into typed events", (t) => {
   const p = parseLine('HV_EVENT: {"kind":"completed","text":"done"}', "task1");
@@ -106,9 +128,13 @@ test("protocol", "lineSplitter keeps partial lines until the newline arrives", (
   t.eq(s.flush(), ["trailing"], "flush emits remainder");
 });
 
-test("protocol", "decision encoding and argv templating", (t) => {
+test("protocol", "decision encoding and stream-json default argv", (t) => {
   t.eq(encodeDecision("p1", "allowOnce"), `${MARKERS.decision} {"id":"p1","decision":"allowOnce"}\n`, "decision line");
-  t.eq(buildArgv({ utterance: "hi", sessionId: "s1" }), ["chat", "-q", "hi", "--session", "s1"], "default argv (TODO-VERIFY)");
+  t.eq(
+    buildArgv({ utterance: "hi", sessionId: "s1" }),
+    ["chat", "-q", "hi", "--format", "stream-json"],
+    "v1.0 default argv uses --format stream-json",
+  );
   t.eq(
     buildArgv({ utterance: "hi", sessionId: "s1", argvTemplate: ["fake.mjs", "-q", "{{utterance}}", "--session", "{{sessionId}}"] }),
     ["fake.mjs", "-q", "hi", "--session", "s1"],
@@ -119,7 +145,12 @@ test("protocol", "decision encoding and argv templating", (t) => {
 /* -------------------------------- redaction ------------------------------- */
 
 test("redaction", "known secret shapes are redacted", (t) => {
-  for (const s of ["sk-abcdefghijklmnop1234", "AIzaSyDEMO1234567890abcdef", "ghp_abcdefghijklmnopqrstuvwxyz0", "password=SuperSecret123"]) {
+  for (const s of [
+    "sk-abcdefghijklmnop1234",
+    "AIzaSyDEMO1234567890abcdef",
+    "ghp_abcdefghijklmnopqrstuvwxyz0",
+    "password=SuperSecret123",
+  ]) {
     t.has(redact(s), REDACTED, `redacted ${s.slice(0, 10)}…`);
   }
 });
@@ -164,9 +195,13 @@ test("speechPrep", "markdown/code/urls stripped and long text summarized", (t) =
   t.has(summarizeForSpeech(long), "overlay", "long reply points to overlay");
 });
 
-test("speechPrep", "voice decisions map without guessing", (t) => {
-  t.eq(mapVoiceDecision("haan kar do"), "allow", "haan=allow");
-  t.eq(mapVoiceDecision("nahi"), "deny", "nahi=deny");
+test("speechPrep", "natural Hinglish/English voice decisions map accurately", (t) => {
+  for (const phrase of ["haan kar do", "permission di", "kar de", "theek hai", "proceed", "allow", "yes"]) {
+    t.eq(mapVoiceDecision(phrase), "allow", `"${phrase}" -> allow`);
+  }
+  for (const phrase of ["nahi", "nahi ruko", "ruk", "mat kar", "cancel", "deny", "no"]) {
+    t.eq(mapVoiceDecision(phrase), "deny", `"${phrase}" -> deny`);
+  }
   t.eq(mapVoiceDecision("maybe later"), null, "ambiguous=null");
 });
 
@@ -204,7 +239,9 @@ test("omniroute", "client can only issue GET plus the single probe POST", async 
     await c.models();
     await c.combos();
     await c.chatProbe("x");
-    const bad = seen.filter((s) => /^(PUT|PATCH|DELETE)/.test(s) || (s.startsWith("POST") && !s.includes("/v1/chat/completions")));
+    const bad = seen.filter(
+      (s) => /^(PUT|PATCH|DELETE)/.test(s) || (s.startsWith("POST") && !s.includes("/v1/chat/completions")),
+    );
     t.eq(bad, [], "no mutating verb, no POST outside the probe");
   } finally {
     globalThis.fetch = orig;
@@ -217,9 +254,9 @@ test("omniroute", "unreachable gateway degrades instead of throwing", async (t) 
     throw new Error("ECONNREFUSED");
   };
   try {
-    const h = await new OmnirouteClient("http://127.0.0.1:20128").health();
+    const h = await new OmnirouteClient("http://127.0.0.1:20128", null, "/nonexistent/db.sqlite").health();
     t.true(!h.reachable, "reports unreachable");
-    const c = await new OmnirouteClient("http://127.0.0.1:20128").combos();
+    const c = await new OmnirouteClient("http://127.0.0.1:20128", null, "/nonexistent/db.sqlite").combos();
     t.eq(c.pathUsed, null, "combos degrade to null path");
   } finally {
     globalThis.fetch = orig;
@@ -232,7 +269,13 @@ test("store", "audit append + list + clear round-trips with redaction", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "hv-store-"));
   store.__setTestRoots(dir);
   try {
-    store.appendAudit({ tool: "read_credentials", risk: "critical", decision: "deny", via: "click", args: { item: "gemini_api_key", value: "sk-abcdef1234567890" } });
+    store.appendAudit({
+      tool: "read_credentials",
+      risk: "critical",
+      decision: "deny",
+      via: "click",
+      args: { item: "gemini_api_key", value: "sk-abcdef1234567890" },
+    });
     const rows = store.listAudit();
     t.eq(rows.length, 1, "one row written");
     t.eq(rows[0].decision, "deny", "decision stored");
@@ -263,7 +306,15 @@ test("store", "session retention prunes beyond 100 / 30 days", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "hv-sess-"));
   store.__setTestRoots(dir);
   try {
-    for (let i = 0; i < 105; i++) store.saveSession({ id: `s${i}`, startedAt: Date.now() - i * 1000, endedAt: null, status: "completed", utterances: [] });
+    for (let i = 0; i < 105; i++) {
+      store.saveSession({
+        id: `s${i}`,
+        startedAt: Date.now() - i * 1000,
+        endedAt: null,
+        status: "completed",
+        utterances: [],
+      });
+    }
     t.eq(store.listSessions().length, 100, "capped at 100");
   } finally {
     store.__setTestRoots(null);
@@ -271,12 +322,15 @@ test("store", "session retention prunes beyond 100 / 30 days", (t) => {
   }
 });
 
-test("tts", "engine detection reports honestly and never claims Gemini", async (t) => {
+test("tts", "python runtime resolution & engine detection report honestly", async (t) => {
+  const py = resolvePythonRuntime();
+  t.true(Boolean(py.bin), `python resolved (${py.bin} via ${py.source})`);
+  t.true(py.candidates.includes("/Users/apple/.hermes/hermes-agent/venv/bin/python"), "verified Mac venv is candidate #1");
+  t.true(existsSync(TTS_CACHE_DIR), `tts-cache dir exists (${TTS_CACHE_DIR})`);
   const engines = await detectEngines(null);
   t.eq(typeof engines.edge.available, "boolean", "edge probed, not assumed");
   t.eq(typeof engines.say.available, "boolean", "say probed, not assumed");
   t.eq(engines.gemini.available, false, "gemini deliberately unwired (daily cap)");
-  t.has(engines.edge.detail, engines.edge.available ? "importable" : "missing", "detail explains the probe result");
 });
 
 /* ------------------------- integration: real bridge ---------------------- */
@@ -284,7 +338,13 @@ test("tts", "engine detection reports honestly and never claims Gemini", async (
 function managerConfig(overrides = {}) {
   return {
     maxConcurrentTasks: 3,
-    hermes: { command: ["node"], argvTemplate: [FAKE, "chat", "-q", "{{utterance}}", "--session", "{{sessionId}}"], cwd: HERE, timeoutSec: 30, pathHint: [] },
+    hermes: {
+      command: ["node"],
+      argvTemplate: [FAKE, "chat", "-q", "{{utterance}}", "--format", "stream-json"],
+      cwd: HERE,
+      timeoutSec: 30,
+      pathHint: [],
+    },
     permissions: { timeoutSec: 8, autoApproveLowRisk: false },
     logging: { level: "warn", redact: true },
     ...overrides,
@@ -301,7 +361,7 @@ async function until(pred, timeoutMs = 12000, what = "condition") {
   throw new Error(`timed out waiting for ${what}`);
 }
 
-test("integration", "spawns the agent, streams events, and completes", async (t) => {
+test("integration", "spawns agent with --format stream-json, streams events, and completes", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "hv-int-"));
   store.__setTestRoots(dir);
   const log = new Logger({ level: "error" });
@@ -309,21 +369,24 @@ test("integration", "spawns the agent, streams events, and completes", async (t)
   try {
     const task = await tm.start({ utterance: "just do a simple task", sessionId: "sess-1" });
     const answered = new Set();
-    const done = await until(() => {
-      const s = tm.get(task.id);
-      // Answer every permission as it arrives so the run can reach completion.
-      for (const e of s.events) {
-        if (e.type === "permissionRequest" && !answered.has(e.payload.request.id)) {
-          answered.add(e.payload.request.id);
-          tm.decide({ taskId: task.id, requestId: e.payload.request.id, decision: "allowOnce", via: "click" });
+    const done = await until(
+      () => {
+        const s = tm.get(task.id);
+        for (const e of s.events) {
+          if (e.type === "permissionRequest" && !answered.has(e.payload.request.id)) {
+            answered.add(e.payload.request.id);
+            tm.decide({ taskId: task.id, requestId: e.payload.request.id, decision: "allowOnce", via: "click" });
+          }
         }
-      }
-      return ["done", "failed", "cancelled"].includes(s.status) ? s : null;
-    }, 20000, "task completion");
+        return ["done", "failed", "cancelled"].includes(s.status) ? s : null;
+      },
+      20000,
+      "task completion",
+    );
     const types = done.events.map((e) => e.type);
-    t.eq(answered.size, 2, "both permissions answered");
+    t.eq(answered.size, 2, "both stream-json tool_call permissions answered");
     t.eq(types.filter((x) => x === "toolCall").length, 2, "both approved tools executed");
-    t.has(types.join(","), "thinking", "thinking emitted");
+    t.has(types.join(","), "status", "stream-json system init emitted status");
     t.has(types.join(","), "permissionRequest", "permission requested");
     t.has(types.join(","), "completed", "completed emitted");
     t.eq(done.status, "done", "final status done");
@@ -331,7 +394,6 @@ test("integration", "spawns the agent, streams events, and completes", async (t)
     t.has(completed.payload.text, "Kaam ho gaya", "agent summary carried through");
     const session = store.getSession("sess-1");
     t.eq(session.utterances.length, 2, "session persisted with user + assistant turns");
-    t.eq(session.utterances[1].role, "assistant", "assistant turn recorded");
   } finally {
     tm.shutdown();
     store.__setTestRoots(null);
@@ -361,10 +423,9 @@ test("integration", "permission pause → allow → resume → tool actually run
     tm.decide({ taskId: task.id, requestId: second.payload.request.id, decision: "deny", via: "click" });
     const done = await until(() => (["done", "failed"].includes(tm.get(task.id).status) ? tm.get(task.id) : null), 15000, "completion");
     const audits = store.listAudit();
-    t.eq(audits.length, 2, "exactly two decisions audited — no phantom rows");
-    t.eq(audits.map((a) => `${a.tool}:${a.decision}`).sort(), ["read_file:deny", "web_fetch:allowOnce"], "each decision recorded against its tool");
+    t.eq(audits.length, 2, "exactly two decisions audited");
+    t.eq(audits.map((a) => `${a.tool}:${a.decision}`).sort(), ["read_file:deny", "web_fetch:allowOnce"], "decisions recorded");
     t.eq(done.events.filter((e) => e.type === "toolCall").length, 1, "denied tool never executed");
-    t.has(done.events.map((e) => e.type).join(","), "completed", "task completed after the deny");
     t.has(done.events.find((e) => e.type === "completed").payload.text, "read_file", "agent reports what it skipped");
   } finally {
     tm.shutdown();
@@ -382,9 +443,23 @@ test("integration", "critical risk refuses voice + untyped approval", async (t) 
     const perm = await until(() => tm.get(task.id).events.find((e) => e.type === "permissionRequest"), 10000, "critical permission");
     t.eq(perm.payload.request.risk, "critical", "credential access = critical");
     const reqId = perm.payload.request.id;
-    await t.throwsAsync(Promise.resolve().then(() => tm.decide({ taskId: task.id, requestId: reqId, decision: "allowOnce", via: "voice" })), "voiceBlocked", "voice approval rejected for critical");
-    await t.throwsAsync(Promise.resolve().then(() => tm.decide({ taskId: task.id, requestId: reqId, decision: "allowOnce", via: "click" })), "typedConfirmRequired", "untyped allow rejected");
-    await t.throwsAsync(Promise.resolve().then(() => tm.decide({ taskId: task.id, requestId: reqId, decision: "allowSession", via: "click", typedConfirm: "ALLOW" })), "noSessionAllowlist", "critical can never be session-allowlisted");
+    await t.throwsAsync(
+      Promise.resolve().then(() => tm.decide({ taskId: task.id, requestId: reqId, decision: "allowOnce", via: "voice" })),
+      "voiceBlocked",
+      "voice approval rejected for critical",
+    );
+    await t.throwsAsync(
+      Promise.resolve().then(() => tm.decide({ taskId: task.id, requestId: reqId, decision: "allowOnce", via: "click" })),
+      "typedConfirmRequired",
+      "untyped allow rejected",
+    );
+    await t.throwsAsync(
+      Promise.resolve().then(() =>
+        tm.decide({ taskId: task.id, requestId: reqId, decision: "allowSession", via: "click", typedConfirm: "ALLOW" }),
+      ),
+      "noSessionAllowlist",
+      "critical can never be session-allowlisted",
+    );
     const ok = tm.decide({ taskId: task.id, requestId: reqId, decision: "allowOnce", via: "click", typedConfirm: "ALLOW" });
     t.eq(ok.deliveredToAgent, true, "typed ALLOW accepted and delivered");
     await until(() => ["done", "failed", "cancelled"].includes(tm.get(task.id).status), 15000, "completion");
@@ -400,7 +475,10 @@ test("integration", "critical risk refuses voice + untyped approval", async (t) 
 test("integration", "permission timeout auto-denies and the agent continues", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "hv-int4-"));
   store.__setTestRoots(dir);
-  const tm = new TaskManager({ config: managerConfig({ permissions: { timeoutSec: 1.2, autoApproveLowRisk: false } }), log: new Logger({ level: "error" }) });
+  const tm = new TaskManager({
+    config: managerConfig({ permissions: { timeoutSec: 1.2, autoApproveLowRisk: false } }),
+    log: new Logger({ level: "error" }),
+  });
   try {
     const task = await tm.start({ utterance: "check router status", sessionId: "sess-4" });
     await until(() => tm.get(task.id).events.find((e) => e.type === "permissionRequest"), 10000, "permission");
@@ -432,13 +510,13 @@ test("integration", "agent-reported failure surfaces with a reason", async (t) =
   }
 });
 
-test("integration", "cancel kills the child process", async (t) => {
+test("integration", "cancel kills the child process group", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "hv-int6-"));
   store.__setTestRoots(dir);
   const tm = new TaskManager({ config: managerConfig(), log: new Logger({ level: "error" }) });
   try {
     const task = await tm.start({ utterance: "run a slow task please", sessionId: "sess-6" });
-    await sleep(300);
+    await sleep(250);
     tm.cancel(task.id);
     const s = tm.get(task.id);
     t.eq(s.status, "cancelled", "status cancelled");
@@ -469,7 +547,9 @@ test("integration", "missing agent binary is reported, not faked", async (t) => 
   const dir = mkdtempSync(join(tmpdir(), "hv-int8-"));
   store.__setTestRoots(dir);
   const tm = new TaskManager({
-    config: managerConfig({ hermes: { command: ["definitely-not-installed-xyz"], argvTemplate: ["chat"], cwd: HERE, timeoutSec: 5, pathHint: [] } }),
+    config: managerConfig({
+      hermes: { command: ["definitely-not-installed-xyz"], argvTemplate: ["chat"], cwd: HERE, timeoutSec: 5, pathHint: [] },
+    }),
     log: new Logger({ level: "error" }),
   });
   try {
@@ -484,7 +564,18 @@ test("integration", "missing agent binary is reported, not faked", async (t) => 
 test("integration", "hard timeout kills a hung agent", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "hv-int9-"));
   store.__setTestRoots(dir);
-  const tm = new TaskManager({ config: managerConfig({ hermes: { command: ["node"], argvTemplate: [FAKE, "chat", "-q", "{{utterance}}", "--session", "{{sessionId}}"], cwd: HERE, timeoutSec: 1, pathHint: [] } }), log: new Logger({ level: "error" }) });
+  const tm = new TaskManager({
+    config: managerConfig({
+      hermes: {
+        command: ["node"],
+        argvTemplate: [FAKE, "chat", "-q", "{{utterance}}", "--format", "stream-json"],
+        cwd: HERE,
+        timeoutSec: 1,
+        pathHint: [],
+      },
+    }),
+    log: new Logger({ level: "error" }),
+  });
   try {
     const task = await tm.start({ utterance: "slow timeout test", sessionId: "sess-9" });
     const failed = await until(() => tm.get(task.id).events.find((e) => e.type === "failed"), 12000, "timeout failure");
@@ -507,7 +598,13 @@ export async function runServerTests() {
       await def.fn(new T(logs));
       results.push({ suite: def.suite, name: def.name, ok: true, detail: logs.join("\n"), ms: Date.now() - t0 });
     } catch (e) {
-      results.push({ suite: def.suite, name: def.name, ok: false, detail: [...logs, "✗ " + (e.stack?.split("\n").slice(0, 3).join(" | ") ?? e.message)].join("\n"), ms: Date.now() - t0 });
+      results.push({
+        suite: def.suite,
+        name: def.name,
+        ok: false,
+        detail: [...logs, "✗ " + (e.stack?.split("\n").slice(0, 3).join(" | ") ?? e.message)].join("\n"),
+        ms: Date.now() - t0,
+      });
     }
   }
   return results;

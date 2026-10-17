@@ -179,8 +179,23 @@ suite("AgentBridge", "decision encoding round-trips", (t) => {
   t.eq(parsed, { id: "abc", decision: "allowOnce" }, "payload round-trips");
 });
 
-suite("AgentBridge", "argv matches the documented contract", (t) => {
-  t.eq(buildHermesArgv({ utterance: "hi", sessionId: "s1" }), ["chat", "-q", "hi", "--session", "s1"], "argv shape (TODO-VERIFY flags)");
+suite("AgentBridge", "argv supports both stream-json (v1.0) and session flag", (t) => {
+  t.eq(buildHermesArgv({ utterance: "hi", sessionId: "s1" }), ["chat", "-q", "hi", "--session", "s1"], "session argv shape");
+  t.eq(
+    buildHermesArgv({ utterance: "hi", sessionId: "s1", streamJson: true }),
+    ["chat", "-q", "hi", "--format", "stream-json"],
+    "stream-json argv shape",
+  );
+});
+
+suite("AgentBridge", "stream-json chunks (system, text, tool_call, result) parse cleanly", (t) => {
+  const sys = parseHermesLine('{"type":"system","subtype":"init","model":"KRITI","session_id":"s1"}', "task1");
+  t.eq(sys?.type, "progress", "system init parsed as progress");
+  const tc = parseHermesLine('{"type":"tool_call","name":"shell","arguments":{"cmd":"rm -rf /tmp/z"}}', "task1");
+  t.eq(tc?.type, "permission", "tool_call parsed as permission");
+  if (tc?.type === "permission") t.eq(tc.request.risk, "critical", "rm -rf escalated to critical");
+  const res = parseHermesLine('{"type":"result","text":"Task ho gaya","exit_code":0}', "task1");
+  t.eq(res?.type, "event", "result parsed as event");
 });
 
 /* --------------------------- OmnirouteTests ---------------------------- */
@@ -255,8 +270,13 @@ suite("SpeechPrep", "long text is summarized with an overlay pointer", (t) => {
 });
 
 suite("VoiceCommands", "hinglish and english approvals map correctly", (t) => {
-  t.eq(mapVoiceDecision("haan kar do"), "allow", "haan = allow");
+  t.eq(mapVoiceDecision("haan kar do"), "allow", "haan kar do = allow");
+  t.eq(mapVoiceDecision("permission di"), "allow", "permission di = allow");
+  t.eq(mapVoiceDecision("kar de"), "allow", "kar de = allow");
+  t.eq(mapVoiceDecision("theek hai"), "allow", "theek hai = allow");
   t.eq(mapVoiceDecision("Allow"), "allow", "allow = allow");
+  t.eq(mapVoiceDecision("nahi ruko"), "deny", "nahi ruko = deny");
+  t.eq(mapVoiceDecision("mat kar"), "deny", "mat kar = deny");
   t.eq(mapVoiceDecision("nahi"), "deny", "nahi = deny");
   t.eq(mapVoiceDecision("no thanks"), "deny", "no = deny");
   t.eq(mapVoiceDecision("maybe later"), null, "ambiguous = null (no guessing)");

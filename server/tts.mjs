@@ -1,21 +1,20 @@
-// server/tts.mjs — unlimited-free TTS first (Edge TTS), macOS `say` fallback.
-// Spec §6.8 / §24: Edge TTS is primary (free, uncapped); Gemini TTS is opt-in and
-// capped at ~10 req/day/key so it is deliberately NOT wired here (LIMITATIONS L-3).
+// server/tts.mjs — Hermes Voice v1.0 Edge TTS + macOS `say` fallback with disk caching (Spec §2.2).
+//
+// Python resolution order (via config.mjs):
+//   1. process.env.HV_PYTHON
+//   2. /Users/apple/.hermes/hermes-agent/venv/bin/python (verified edge-tts 7.3.1 venv)
+//   3. ~/.hermes/installs/*/venv/bin/python
+//   4. python3
+//
+// Cache directory: ~/.hermes-voice/scratch/tts-cache/ (auto-created recursively).
 
 import { spawn, execFile } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
-import { SCRATCH_DIR } from "./config.mjs";
+import { SCRATCH_DIR, TTS_CACHE_DIR, resolvePythonRuntime } from "./config.mjs";
 import { redact } from "./redact.mjs";
 import { speechify, summarizeForSpeech } from "./speechPrep.mjs";
-
-function resolvePython() {
-  if (process.env.HV_PYTHON && existsSync(process.env.HV_PYTHON)) return process.env.HV_PYTHON;
-  const venvPy = join(homedir(), ".hermes/hermes-agent/venv/bin/python");
-  if (existsSync(venvPy)) return venvPy;
-  return "python3";
-}
 
 const CONCURRENCY = 2;
 let inFlight = 0;
@@ -45,77 +44,165 @@ function guarded(fn) {
 }
 
 function has(bin) {
-  return new Promise((res) => execFile("sh", ["-c", `command -v ${bin}`], (err, stdout) => res(!err && stdout.trim().length > 0)));
+  return new Promise((res) =>
+    execFile("sh", ["-c", `command -v ${bin}`], (err, stdout) => res(!err && stdout.trim().length > 0)),
+  );
 }
 
-/** Which engines actually exist on this machine — probed, never assumed. */
+/**
+ * Probes the resolved Python runtime and macOS `say` / `afconvert` / `ffmpeg`.
+ * Never assumes a package is installed without probing it.
+ */
 export async function detectEngines(log) {
-  const pyBin = resolvePython();
-  const [pythonFound, sayBin] = await Promise.all([has(pyBin), has("say")]);
+  mkdirSync(TTS_CACHE_DIR, { recursive: true });
+  const py = resolvePythonRuntime();
+  const [sayBin, afconvertBin, ffmpegBin] = await Promise.all([has("say"), has("afconvert"), has("ffmpeg")]);
+
   let edge = false;
-  let edgeDetail = `${pyBin} not found`;
-  if (pythonFound) {
-    edge = await new Promise((res) =>
-      execFile(pyBin, ["-c", "import edge_tts; print(edge_tts.__version__ if hasattr(edge_tts,'__version__') else 'ok')"], (err) => res(!err)),
-    );
-    edgeDetail = edge ? "edge_tts importable" : `${pyBin} present but edge_tts missing (pip install edge-tts)`;
+  let edgeVersion = null;
+  let edgeDetail = `python runtime (${py.bin}) not found`;
+
+  const pycheck = await new Promise((res) =>
+    execFile(
+      py.bin,
+      ["-c", "import edge_tts; print(getattr(edge_tts, '__version__', 'installed'))"],
+      { timeout: 6000 },
+      (err, stdout, stderr) => res({ ok: !err, out: (stdout || "").trim(), err: (stderr || err?.message || "").trim() }),
+    ),
+  );
+
+  if (pycheck.ok) {
+    edge = true;
+    edgeVersion = pycheck.out || "installed";
+    edgeDetail = `edge-tts ${edgeVersion} via ${py.bin} (${py.source})`;
+  } else {
+    edgeDetail = `${py.bin} (${py.source}) missing edge_tts (${pycheck.err.slice(0, 120) || "pip install edge-tts"})`;
   }
+
   const engines = {
-    edge: { available: edge, detail: edgeDetail, cost: "free, unlimited" },
-    say: { available: sayBin, detail: sayBin ? "macOS `say` available" : "macOS `say` not found (non-mac host)", cost: "free" },
-    gemini: { available: false, detail: "deliberately not wired: ~10 req/day/key cap (LIMITATIONS L-3)", cost: "free tier capped" },
+    edge: {
+      available: edge,
+      version: edgeVersion,
+      pythonBin: py.bin,
+      pythonSource: py.source,
+      verifiedVenv: py.verifiedVenv,
+      detail: edgeDetail,
+      cost: "free, unlimited",
+    },
+    say: {
+      available: sayBin,
+      converter: afconvertBin ? "afconvert" : ffmpegBin ? "ffmpeg" : null,
+      detail: sayBin
+        ? `macOS \`say\` available${afconvertBin ? " + afconvert" : ffmpegBin ? " + ffmpeg" : ""}`
+        : "macOS `say` not found (non-macOS host)",
+      cost: "free, local",
+    },
+    gemini: {
+      available: false,
+      detail: "deliberately not wired: ~10 req/day/key free-tier cap (Spec §1.5)",
+      cost: "free tier capped",
+    },
   };
-  log?.info("tts", `engines: edge=${engines.edge.available} say=${engines.say.available} (${engines.edge.detail})`);
+  log?.info("tts", `engines: edge=${engines.edge.available} (${engines.edge.pythonBin}) say=${engines.say.available}`);
   return engines;
 }
 
 /**
- * Synthesize to a scratch file.
- * Secret-safety: text is redacted before it ever reaches a network TTS endpoint.
+ * Synthesizes speech into ~/.hermes-voice/scratch/tts-cache/ (or SCRATCH_DIR).
+ * Uses SHA-256 content-addressed caching for instant replay of repeated prompts.
  */
-export async function synthesize({ text, voice = "hi-IN-MadhurNeural", rate = "+0%", engine = "edge", maxChars = 900 }, log) {
+export async function synthesize(
+  {
+    text,
+    voice = "hi-IN-MadhurNeural",
+    rate = "+0%",
+    engine = "edge",
+    maxChars = 900,
+    cacheDir = TTS_CACHE_DIR,
+  },
+  log,
+) {
   const prepared = summarizeForSpeech(speechify(text), maxChars);
   const safe = redact(prepared);
   if (safe !== prepared) log?.warn("tts", "secret pattern found in spoken text — redacted before synthesis");
   if (!safe.trim()) return { ok: false, engine, error: "empty text after preparation" };
 
+  mkdirSync(cacheDir, { recursive: true });
+  mkdirSync(SCRATCH_DIR, { recursive: true });
+
+  const hash = createHash("sha256").update(`${voice}|${rate}|${safe}`).digest("hex").slice(0, 18);
+
   return guarded(async () => {
     const t0 = Date.now();
-    const id = crypto.randomUUID().slice(0, 8);
+    const py = resolvePythonRuntime();
 
     if (engine === "edge" || engine === "auto") {
-      const out = join(SCRATCH_DIR, `hv-tts-${id}.mp3`);
+      const cachedMp3 = join(cacheDir, `hv-tts-${hash}.mp3`);
+      if (existsSync(cachedMp3) && statSync(cachedMp3).size > 128) {
+        return okResult(cachedMp3, "edge", "audio/mpeg", t0, safe, true);
+      }
       try {
-        await runEdge(safe, voice, rate, out);
-        return ok(out, "edge", "audio/mpeg", t0, safe);
+        await runEdge(py.bin, safe, voice, rate, cachedMp3);
+        return okResult(cachedMp3, "edge", "audio/mpeg", t0, safe, false);
       } catch (e) {
-        if (engine === "edge") return { ok: false, engine: "edge", error: e.message, hint: "pip install edge-tts" };
-        log?.warn("tts", `edge-tts failed (${e.message}) — falling back to \`say\``);
+        if (engine === "edge" && !(await has("say"))) {
+          return {
+            ok: false,
+            engine: "edge",
+            pythonBin: py.bin,
+            error: e.message,
+            hint: `Verify ${py.bin} -m pip install edge-tts`,
+          };
+        }
+        log?.warn("tts", `edge-tts failed (${e.message}) — falling back to macOS \`say\``);
       }
     }
 
-    const out = join(SCRATCH_DIR, `hv-tts-${id}.aiff`);
+    const aiffOut = join(cacheDir, `hv-tts-${hash}.aiff`);
+    const wavOut = join(cacheDir, `hv-tts-${hash}.wav`);
     try {
-      await runSay(safe, voiceForSay(voice), out);
-      return ok(out, "say", "audio/aiff", t0, safe);
+      if (existsSync(wavOut) && statSync(wavOut).size > 128) {
+        return okResult(wavOut, "say", "audio/wav", t0, safe, true);
+      }
+      await runSay(safe, voiceForSay(voice), aiffOut);
+      if (await has("afconvert")) {
+        await runConvert("afconvert", ["-f", "WAVE", "-d", "LEI16@22050", aiffOut, wavOut]);
+        if (existsSync(wavOut)) return okResult(wavOut, "say", "audio/wav", t0, safe, false);
+      } else if (await has("ffmpeg")) {
+        await runConvert("ffmpeg", ["-y", "-i", aiffOut, wavOut]);
+        if (existsSync(wavOut)) return okResult(wavOut, "say", "audio/wav", t0, safe, false);
+      }
+      return okResult(aiffOut, "say", "audio/aiff", t0, safe, false);
     } catch (e) {
-      return { ok: false, engine: "say", error: e.message };
+      return { ok: false, engine: "say", error: e.message, hint: "Install edge-tts or run on macOS with `say`" };
     }
   });
 }
 
-function ok(file, engine, mime, t0, spokenText) {
+function okResult(file, engine, mime, t0, spokenText, cached = false) {
   if (!existsSync(file)) return { ok: false, engine, error: "synthesiser produced no file" };
-  return { ok: true, engine, mime, file, bytes: statSync(file).size, ms: Date.now() - t0, spokenText };
+  return {
+    ok: true,
+    engine,
+    mime,
+    file,
+    cached,
+    bytes: statSync(file).size,
+    ms: Date.now() - t0,
+    spokenText,
+  };
 }
 
-function runEdge(text, voice, rate, out) {
-  const pyBin = resolvePython();
+function runEdge(pythonBin, text, voice, rate, out) {
   return new Promise((resolve, reject) => {
-    const child = spawn(pyBin, ["-m", "edge_tts", "--voice", voice, "--rate", rate, "--text", text, "--write-media", out], {
-      stdio: ["ignore", "ignore", "pipe"],
-      env: { ...process.env, PYTHONIOENCODING: "utf-8", LANG: "en_US.UTF-8" },
-    });
+    const child = spawn(
+      pythonBin,
+      ["-m", "edge_tts", "--voice", voice, "--rate", rate, "--text", text, "--write-media", out],
+      {
+        stdio: ["ignore", "ignore", "pipe"],
+        env: { ...process.env, PYTHONIOENCODING: "utf-8", LANG: "en_US.UTF-8" },
+      },
+    );
     let err = "";
     child.stderr.on("data", (d) => (err += d.toString().slice(0, 2000)));
     const timer = setTimeout(() => {
@@ -124,7 +211,7 @@ function runEdge(text, voice, rate, out) {
     }, 30000);
     child.on("error", (e) => {
       clearTimeout(timer);
-      reject(new Error(`cannot spawn ${pyBin}: ${e.message}`));
+      reject(new Error(`cannot spawn ${pythonBin}: ${e.message}`));
     });
     child.on("close", (code) => {
       clearTimeout(timer);
@@ -154,9 +241,14 @@ function runSay(text, voice, out) {
   });
 }
 
-/** hi-IN-MadhurNeural has no `say` equivalent; pick the closest installed voice. */
+function runConvert(bin, args) {
+  return new Promise((resolve) => {
+    execFile(bin, args, { timeout: 10000 }, () => resolve());
+  });
+}
+
 function voiceForSay(edgeVoice) {
   if (/^hi-/i.test(edgeVoice)) return "Lekha";
   if (/^en-IN/i.test(edgeVoice)) return "Rishi";
-  return null;
+  return "Rishi";
 }

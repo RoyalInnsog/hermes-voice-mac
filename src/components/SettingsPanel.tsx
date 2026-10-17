@@ -21,7 +21,9 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
             onClick={() => setTab(x)}
             className={cn(
               "w-full rounded-lg px-3 py-2 text-left text-[12.5px] font-500 transition-all",
-              tab === x ? "bg-white text-[var(--color-pine)] shadow-[0_1px_3px_rgba(15,19,25,0.08)] ring-1 ring-[var(--color-line)]" : "text-[var(--color-muted)] hover:bg-white/60 hover:text-[var(--color-ink-2)]",
+              tab === x
+                ? "bg-[#1e1a14] text-[var(--color-gold)] shadow-[0_2px_8px_rgba(0,0,0,0.45)] ring-1 ring-[var(--color-gold)]/35"
+                : "text-[var(--color-muted)] hover:bg-[#181510] hover:text-[var(--color-ink-2)]",
             )}
           >
             {x}
@@ -220,7 +222,11 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
               {o.backend.memory?.available ? (
                 <div className="flex flex-wrap gap-1.5">
                   {o.backend.memory.files.slice(0, 24).map((f) => (
-                    <button key={f} onClick={() => void o.loadMemoryFile(f)} className="rounded-full border border-[var(--color-line)] bg-white px-2.5 py-1 font-mono text-[10.5px] text-[var(--color-ink-2)] transition-colors hover:border-[var(--color-pine-bright)] hover:text-[var(--color-pine)]">
+                    <button
+                      key={f}
+                      onClick={() => void o.loadMemoryFile(f)}
+                      className="rounded-full border border-[var(--color-line)] bg-[#1b1814] px-2.5 py-1 font-mono text-[10.5px] text-[var(--color-ink-2)] transition-colors hover:border-[var(--color-gold)] hover:text-[var(--color-gold)]"
+                    >
                       {f}
                     </button>
                   ))}
@@ -241,9 +247,9 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
           <>
             <Panel className="p-4">
               <SectionTitle hint="read-only client">Omniroute</SectionTitle>
-              <div className="mb-3 rounded-xl border border-[rgba(172,35,64,0.22)] bg-[var(--color-rose-wash)] px-3 py-2.5 text-[11.5px] leading-relaxed text-[#8d2038]">
-                <span className="font-600">HARD RULE:</span> ye app Omniroute ko kabhi stop/restart/reconfigure nahi karti, combos ya 9router DB kabhi edit nahi karti.
-                Sirf GET + ek non-mutating <span className="font-mono">stream:false</span> probe. Test suite isi ko enforce karti hai.
+              <div className="mb-3 rounded-xl border border-[rgba(229,83,101,0.3)] bg-[var(--color-rose-wash)] px-3 py-2.5 text-[11.5px] leading-relaxed text-[#ff9ca7]">
+                <span className="font-600">HARD RULE:</span> ye app Omniroute ko kabhi stop/restart/reconfigure nahi karti, combos ya 9router DB (`~/.9router/db/data.sqlite`) kabhi edit nahi karti.
+                Sirf GET + read-only SQLite + ek non-mutating <span className="font-mono">stream:false</span> probe.
               </div>
               <Row label="Base URL" hint="Bridge isi ko proxy karta hai — browser ke CORS problem se bachne ke liye.">
                 <TextField mono value={s.omnirouteBaseURL} onChange={(v) => o.update("omnirouteBaseURL", v)} className="w-[250px]" />
@@ -289,7 +295,14 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
               </div>
               <p className="mt-2.5 font-mono text-[10.5px] text-[var(--color-muted)]">{o.health?.detail ?? "no probe yet"}</p>
               {o.probe && (
-                <div className={cn("mt-3 rounded-xl border px-3 py-2.5 font-mono text-[11.5px] leading-relaxed", o.probe.ok ? "border-[rgba(11,107,96,0.25)] bg-[var(--color-pine-wash)] text-[var(--color-pine)]" : "border-[rgba(172,35,64,0.22)] bg-[var(--color-rose-wash)] text-[#8d2038]")}>
+                <div
+                  className={cn(
+                    "mt-3 rounded-xl border px-3 py-2.5 font-mono text-[11.5px] leading-relaxed",
+                    o.probe.ok
+                      ? "border-[rgba(52,199,138,0.3)] bg-[var(--color-emerald-wash)] text-[var(--color-emerald)]"
+                      : "border-[rgba(229,83,101,0.3)] bg-[var(--color-rose-wash)] text-[#ff9ca7]",
+                  )}
+                >
                   probe {o.probe.model} → {o.probe.ok ? "OK" : "FAIL"} · {o.probe.latencyMs}ms
                   <div className="mt-1 break-all text-[var(--color-ink-2)]">{o.probe.ok ? o.probe.sample || "(empty content)" : o.probe.error}</div>
                 </div>

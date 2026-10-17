@@ -8,34 +8,44 @@ import { DOCS } from "../docs/content";
 import { cn } from "../utils/cn";
 import type { AuditEntry, LogLevel, RiskLevel } from "../lib/types";
 
-const RISK_COLOR: Record<RiskLevel, string> = { low: "#0b6b60", medium: "#a9650a", high: "#b4441a", critical: "#ac2340" };
-const RISK_BG: Record<RiskLevel, string> = { low: "var(--color-pine-wash)", medium: "var(--color-amber-wash)", high: "#fbe9e0", critical: "var(--color-rose-wash)" };
+const RISK_COLOR: Record<RiskLevel, string> = {
+  low: "#34c78a",
+  medium: "#e5a93c",
+  high: "#f59e0b",
+  critical: "#e55365",
+};
+const RISK_BG: Record<RiskLevel, string> = {
+  low: "var(--color-emerald-wash)",
+  medium: "var(--color-gold-wash)",
+  high: "rgba(245, 158, 11, 0.16)",
+  critical: "var(--color-rose-wash)",
+};
 
 /* -------------------------------- Backend -------------------------------- */
 
 const ENDPOINTS: { method: string; path: string; what: string }[] = [
-  { method: "GET", path: "/api/health", what: "bridge + hermes + omniroute + tts capability" },
-  { method: "POST", path: "/api/tasks", what: "spawn the agent, returns taskId" },
-  { method: "GET", path: "/api/tasks/:id/events", what: "SSE stream of AgentEvents" },
-  { method: "POST", path: "/api/tasks/:id/permissions/:rid/decision", what: "decision → child stdin" },
-  { method: "DELETE", path: "/api/tasks/:id", what: "cancel (SIGTERM → SIGKILL)" },
-  { method: "GET", path: "/api/router/health", what: "read-only proxy to Omniroute" },
-  { method: "GET", path: "/api/router/models", what: "GET /v1/models" },
-  { method: "GET", path: "/api/router/combos", what: "read-only combo discovery" },
-  { method: "POST", path: "/api/router/probe", what: "chat completions, stream:false" },
-  { method: "POST", path: "/api/tts", what: "edge-tts → audio file (say fallback)" },
-  { method: "GET", path: "/api/audit", what: "append-only, redacted decisions" },
-  { method: "GET", path: "/api/sessions", what: "persisted sessions (100 / 30d)" },
-  { method: "GET", path: "/api/memory", what: "read-only ~/.hermes/memories" },
-  { method: "GET", path: "/api/logs", what: "redacted bridge logs" },
-  { method: "GET", path: "/api/selftest", what: "runs the backend test suite live" },
+  { method: "GET", path: "/", what: "serves compiled production dist/index.html & static assets" },
+  { method: "GET", path: "/api/health", what: "bridge v1.0 + python venv + hermes + omniroute + tts" },
+  { method: "POST", path: "/api/tasks", what: "spawns hermes chat -q <query> --format stream-json" },
+  { method: "GET", path: "/api/tasks/:id/events", what: "SSE stream of stream-json & HV_* events" },
+  { method: "POST", path: "/api/tasks/:id/permissions/:rid/decision", what: "relays HV_DECISION to child stdin" },
+  { method: "DELETE", path: "/api/tasks/:id", what: "process-group cancel (SIGTERM → 5s → SIGKILL)" },
+  { method: "GET", path: "/api/router/health", what: "read-only proxy to OmniRoute 127.0.0.1:20128" },
+  { method: "GET", path: "/api/router/sqlite", what: "read-only SQLite sync of ~/.9router/db/data.sqlite" },
+  { method: "GET", path: "/api/router/combos", what: "read-only combo discovery (HTTP + SQLite)" },
+  { method: "POST", path: "/api/router/probe", what: "chat completions probe (stream:false enforced)" },
+  { method: "POST", path: "/api/tts", what: "Edge TTS (cached in tts-cache/) + macOS say fallback" },
+  { method: "GET", path: "/api/audit", what: "append-only, redacted permission audit log" },
+  { method: "GET", path: "/api/sessions", what: "persisted sessions (100 / 30d retention)" },
+  { method: "GET", path: "/api/memory", what: "jailed read-only ~/.hermes/memories" },
+  { method: "GET", path: "/api/selftest", what: "runs the 30-case backend test suite live" },
 ];
 
 const START_CMDS = [
-  { label: "Real Hermes (jab CLI ready ho)", cmd: "node server/index.mjs" },
-  { label: "Simulated agent (aaj hi verify karo)", cmd: 'HV_HERMES_CMD="node server/fake-hermes.mjs" node server/index.mjs' },
-  { label: "Live end-to-end probe", cmd: "node scripts/probe-bridge.mjs" },
-  { label: "Backend test suite", cmd: "node server/selftest.mjs" },
+  { label: "Start Self-Contained Server (UI + API on :20130)", cmd: "node server/index.mjs" },
+  { label: "Run v1.0 End-to-End Verification Suite", cmd: "node scripts/verify-v1.mjs" },
+  { label: "Build Native macOS Floating HUD App (.app)", cmd: "bash scripts/build-macos-app.sh" },
+  { label: "Run 30-Case Backend Test Suite", cmd: "node server/selftest.mjs" },
 ];
 
 export function BackendPanel({ o }: { o: Orchestrator }) {
@@ -159,7 +169,7 @@ export function BackendPanel({ o }: { o: Orchestrator }) {
             {o.backend.tests && (
               <div className="mt-3 max-h-[240px] space-y-1 overflow-y-auto">
                 {o.backend.tests.results.map((r) => (
-                  <details key={r.suite + r.name} className="rounded-lg border border-[var(--color-line-soft)] bg-white px-2.5 py-1.5">
+                  <details key={r.suite + r.name} className="rounded-lg border border-[var(--color-line-soft)] bg-[#14120f] px-2.5 py-1.5">
                     <summary className="flex cursor-pointer items-center gap-2 text-[11.5px]">
                       <span className={r.ok ? "text-[var(--color-pine)]" : "text-[var(--color-rose)]"}>{r.ok ? "✓" : "✗"}</span>
                       <span className="font-mono text-[10px] uppercase text-[var(--color-faint)]">{r.suite}</span>
@@ -224,8 +234,8 @@ export function SessionsPanel({ o }: { o: Orchestrator }) {
       ) : (
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
           {merged.map((s) => (
-            <div key={s.id} className="overflow-hidden rounded-xl border border-[var(--color-line)] bg-white">
-              <button onClick={() => setOpen(open === s.id ? null : s.id)} className="flex w-full items-center gap-3 px-3.5 py-2.5 text-left transition-colors hover:bg-[var(--color-sunken)]">
+            <div key={s.id} className="overflow-hidden rounded-xl border border-[var(--color-line)] bg-[#161411]">
+              <button onClick={() => setOpen(open === s.id ? null : s.id)} className="flex w-full items-center gap-3 px-3.5 py-2.5 text-left transition-colors hover:bg-[#1c1914]">
                 <Badge tone={s.status === "completed" ? "green" : s.status === "abandoned" ? "rose" : "amber"}>{s.status}</Badge>
                 <span className="font-mono text-[11px] text-[var(--color-muted)]">{s.id.slice(0, 8)}</span>
                 <span className="text-[11.5px] text-[var(--color-faint)]">{new Date(s.startedAt).toLocaleString()}</span>
@@ -280,7 +290,7 @@ export function AuditPanel({ o }: { o: Orchestrator }) {
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto pr-1">
           <table className="w-full text-left text-[11.5px]">
-            <thead className="sticky top-0 bg-white">
+            <thead className="sticky top-0 bg-[#161411]">
               <tr className="text-[var(--color-faint)]">
                 {["Time", "Risk", "Tool", "Decision", "Via", "Args (redacted)"].map((x) => (
                   <th key={x} className="border-b border-[var(--color-line)] py-2 pr-3 font-mono text-[10px] font-500 uppercase tracking-[0.08em]">
@@ -441,9 +451,9 @@ export function DiagnosticsPanel({ o }: { o: Orchestrator }) {
                 </div>
                 <div className="space-y-1">
                   {rs.map((r) => (
-                    <details key={r.name} className="rounded-lg border border-[var(--color-line-soft)] bg-white px-2.5 py-1.5">
+                    <details key={r.name} className="rounded-lg border border-[var(--color-line-soft)] bg-[#14120f] px-2.5 py-1.5">
                       <summary className="flex cursor-pointer items-center gap-2 text-[11.5px]">
-                        <span className={r.ok ? "text-[var(--color-pine)]" : "text-[var(--color-rose)]"}>{r.ok ? "✓" : "✗"}</span>
+                        <span className={r.ok ? "text-[var(--color-emerald)]" : "text-[var(--color-rose)]"}>{r.ok ? "✓" : "✗"}</span>
                         <span className="truncate text-[var(--color-ink-2)]">{r.name}</span>
                         <span className="ml-auto shrink-0 font-mono text-[10px] text-[var(--color-faint)]">{r.ms}ms</span>
                       </summary>
@@ -461,8 +471,8 @@ export function DiagnosticsPanel({ o }: { o: Orchestrator }) {
         <SectionTitle hint="probed, never assumed">Runtime capabilities</SectionTitle>
         <div className="grid gap-2 sm:grid-cols-2">
           {caps.map(([label, ok, note]) => (
-            <div key={label} className="flex items-center gap-2.5 rounded-xl border border-[var(--color-line)] bg-white px-3 py-2">
-              <span className={cn("h-2 w-2 shrink-0 rounded-full", ok ? "bg-[var(--color-pine-bright)]" : "bg-[#c9d1dc]")} />
+            <div key={label} className="flex items-center gap-2.5 rounded-xl border border-[var(--color-line)] bg-[#14120f] px-3 py-2">
+              <span className={cn("h-2 w-2 shrink-0 rounded-full", ok ? "bg-[var(--color-emerald)]" : "bg-[#433a2d]")} />
               <span className="min-w-0 flex-1 truncate text-[12px] font-500 text-[var(--color-ink-2)]">{label}</span>
               <span className={cn("shrink-0 font-mono text-[10px] uppercase", ok ? "text-[var(--color-pine)]" : "text-[var(--color-faint)]")}>{ok ? "yes" : "no"}</span>
               <span className="hidden shrink-0 truncate font-mono text-[10px] text-[var(--color-faint)] lg:inline">{note}</span>
@@ -542,7 +552,9 @@ export function DocsPanel() {
             onClick={() => setActive(d.id)}
             className={cn(
               "w-full rounded-xl px-3 py-2.5 text-left transition-all",
-              active === d.id ? "bg-white shadow-[0_1px_3px_rgba(15,19,25,0.08)] ring-1 ring-[var(--color-line)]" : "hover:bg-white/60",
+              active === d.id
+                ? "bg-[#1d1914] shadow-[0_2px_8px_rgba(0,0,0,0.45)] ring-1 ring-[var(--color-gold)]/35"
+                : "hover:bg-[#171410]",
             )}
           >
             <div className={cn("font-mono text-[11px] font-600", active === d.id ? "text-[var(--color-pine)]" : "text-[var(--color-ink-2)]")}>{d.title}</div>

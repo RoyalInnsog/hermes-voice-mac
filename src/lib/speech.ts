@@ -1,14 +1,10 @@
-// Section 6.4 / 6.8 — STT + TTS engines.
-// Browser equivalents of the native AppleSTTEngine / AppleTTSEngine.
-// Edge TTS + Gemini TTS are not reachable from a sandboxed page (see LIMITATIONS L-3),
-// so selecting them falls back to the system voice and raises ttsEngineMissing.
+// src/lib/speech.ts — Hermes Voice v1.0 STT + TTS + Silence Auto-Stop & Voice Decision Matcher (Spec §2.4).
 
 /* ----------------------------- TTS text prep ----------------------------- */
 
-/** Strip markdown / code / URLs so the synthesiser doesn't read punctuation soup. */
 export function speechify(input: string): string {
   let s = input;
-  s = s.replace(/```[\s\S]*?```/g, " code block, detail overlay me hai, ");
+  s = s.replace(/```[\s\S]*?```/g, " code block, detail console me hai, ");
   s = s.replace(/`([^`]+)`/g, "$1");
   s = s.replace(/!\[[^\]]*\]\([^)]*\)/g, " image ");
   s = s.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
@@ -19,7 +15,6 @@ export function speechify(input: string): string {
   return s.trim();
 }
 
-/** Long replies: speak the gist, show the full text. */
 export function summarizeForSpeech(input: string, maxSentences = 3, maxChars = 320): string {
   const clean = speechify(input);
   if (clean.length <= maxChars) return clean;
@@ -44,10 +39,12 @@ export interface SpeakOptions {
   pitch?: number;
   volume?: number;
   voiceURI?: string | null;
+  onBoundaryLevel?: (level: number) => void;
 }
 
 export class WebTTSEngine {
   private currentPriority: SpeechPriority = "low";
+  private synthTimer = 0;
   speaking = false;
 
   static supported(): boolean {
@@ -59,7 +56,9 @@ export class WebTTSEngine {
     return window.speechSynthesis.getVoices();
   }
 
+  /** Immediate barge-in stop (Spec §2.4). */
   stop() {
+    window.clearInterval(this.synthTimer);
     if (!WebTTSEngine.supported()) return;
     window.speechSynthesis.cancel();
     this.speaking = false;
@@ -69,7 +68,6 @@ export class WebTTSEngine {
     const priority = opts.priority ?? "normal";
     if (!WebTTSEngine.supported() || !text.trim()) return Promise.resolve();
 
-    // Priority queue rule: higher priority interrupts lower.
     const rank: Record<SpeechPriority, number> = { low: 0, normal: 1, high: 2 };
     if (this.speaking && rank[priority] < rank[this.currentPriority]) return Promise.resolve();
     if (this.speaking) this.stop();
@@ -84,7 +82,17 @@ export class WebTTSEngine {
         const v = this.voices().find((x) => x.voiceURI === opts.voiceURI);
         if (v) u.voice = v;
       }
+
+      if (opts.onBoundaryLevel) {
+        window.clearInterval(this.synthTimer);
+        this.synthTimer = window.setInterval(() => {
+          opts.onBoundaryLevel?.(0.28 + Math.random() * 0.45);
+        }, 70);
+      }
+
       const done = () => {
+        window.clearInterval(this.synthTimer);
+        opts.onBoundaryLevel?.(0);
         this.speaking = false;
         resolve();
       };
@@ -93,7 +101,6 @@ export class WebTTSEngine {
       this.currentPriority = priority;
       this.speaking = true;
       window.speechSynthesis.speak(u);
-      // Safety net: some engines never fire onend for long text.
       setTimeout(done, Math.min(60000, 2500 + text.length * 90));
     });
   }
@@ -127,24 +134,40 @@ function getRecognitionCtor(): (new () => AnySpeechRecognition) | null {
   return Ctor ?? null;
 }
 
+/** Silence auto-stop window after speech has been detected (Spec §2.4: 1.8s). */
+export const SILENCE_AUTO_STOP_MS = 1800;
+
 export class WebSTTEngine {
   private rec: AnySpeechRecognition | null = null;
   private finalText = "";
+  private interimText = "";
   private bestConfidence = 0;
   private stream: MediaStream | null = null;
   private audioCtx: AudioContext | null = null;
   private raf = 0;
+  private silenceTimer = 0;
+  private hasSpoken = false;
   listening = false;
 
   static supported(): boolean {
     return typeof window !== "undefined" && getRecognitionCtor() !== null;
   }
 
-  /** Mic level meter — Section 6.3 AudioLevelMeter (RMS for the waveform). */
+  private resetSilenceTimer() {
+    window.clearTimeout(this.silenceTimer);
+    if (!this.hasSpoken) return;
+    this.silenceTimer = window.setTimeout(() => {
+      if (this.listening && this.hasSpoken) {
+        this.stop();
+      }
+    }, SILENCE_AUTO_STOP_MS);
+  }
+
   private async startMeter(onLevel: (rms: number) => void) {
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const Ctx = (window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext) as typeof AudioContext;
+      const Ctx = (window.AudioContext ??
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext) as typeof AudioContext;
       this.audioCtx = new Ctx();
       const src = this.audioCtx.createMediaStreamSource(this.stream);
       const analyser = this.audioCtx.createAnalyser();
@@ -158,16 +181,21 @@ export class WebSTTEngine {
           const v = (buf[i] - 128) / 128;
           sum += v * v;
         }
-        onLevel(Math.sqrt(sum / buf.length));
+        const rms = Math.sqrt(sum / buf.length);
+        onLevel(rms);
+        if (this.hasSpoken && rms > 0.045) {
+          this.resetSilenceTimer();
+        }
         this.raf = requestAnimationFrame(tick);
       };
       tick();
     } catch {
-      /* meter is cosmetic; recognition can still run */
+      /* meter is cosmetic; recognition still works */
     }
   }
 
   private stopMeter() {
+    window.clearTimeout(this.silenceTimer);
     cancelAnimationFrame(this.raf);
     this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null;
@@ -183,18 +211,23 @@ export class WebSTTEngine {
     }
     if (this.listening) return;
     this.finalText = "";
+    this.interimText = "";
     this.bestConfidence = 0;
+    this.hasSpoken = false;
 
     if (cb.onLevel) await this.startMeter(cb.onLevel);
 
     const rec = new Ctor();
-    rec.lang = locale;
+    rec.lang = locale || "en-IN";
     rec.continuous = true;
     rec.interimResults = true;
     rec.maxAlternatives = 1;
 
     rec.onresult = (ev: unknown) => {
-      const e = ev as { resultIndex: number; results: ArrayLike<ArrayLike<{ transcript: string; confidence: number }> & { isFinal: boolean }> };
+      const e = ev as {
+        resultIndex: number;
+        results: ArrayLike<ArrayLike<{ transcript: string; confidence: number }> & { isFinal: boolean }>;
+      };
       let interim = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const r = e.results[i];
@@ -206,22 +239,40 @@ export class WebSTTEngine {
           interim += alt.transcript;
         }
       }
-      cb.onPartial((this.finalText + " " + interim).trim());
+      this.interimText = interim.trim();
+      const combined = (this.finalText + " " + this.interimText).trim();
+      if (combined) {
+        this.hasSpoken = true;
+        this.resetSilenceTimer();
+      }
+      cb.onPartial(combined);
     };
 
     rec.onerror = (ev: unknown) => {
       const e = ev as { error?: string; message?: string };
-      const code = e.error === "not-allowed" || e.error === "service-not-allowed" ? "not-allowed" : e.error === "no-speech" ? "no-speech" : "other";
+      if (e.error === "language-not-supported" && rec.lang !== "en-US") {
+        rec.lang = "en-US";
+        try {
+          rec.start();
+          return;
+        } catch {
+          /* fall through */
+        }
+      }
+      const code =
+        e.error === "not-allowed" || e.error === "service-not-allowed"
+          ? "not-allowed"
+          : e.error === "no-speech"
+            ? "no-speech"
+            : "other";
       cb.onError(code, e.message || e.error || "speech error");
     };
 
     rec.onend = () => {
       this.listening = false;
       this.stopMeter();
-      const text = this.finalText.trim();
-      // Chrome often reports confidence 0 for interim-heavy sessions; treat
-      // "we got words but no score" as a mid confidence rather than a failure.
-      const conf = this.bestConfidence > 0 ? this.bestConfidence : text ? 0.72 : 0;
+      const text = (this.finalText || this.interimText).trim();
+      const conf = this.bestConfidence > 0 ? this.bestConfidence : text ? 0.78 : 0;
       cb.onFinal(text, conf);
     };
 
@@ -236,6 +287,7 @@ export class WebSTTEngine {
   }
 
   stop() {
+    window.clearTimeout(this.silenceTimer);
     if (!this.rec) return;
     try {
       this.rec.stop();
@@ -246,6 +298,7 @@ export class WebSTTEngine {
   }
 
   abort() {
+    window.clearTimeout(this.silenceTimer);
     if (!this.rec) return;
     try {
       this.rec.abort();
@@ -259,9 +312,15 @@ export class WebSTTEngine {
 
 /* --------------------- voice command mapping (approvals) ----------------- */
 
+const DENY_RE =
+  /\b(nahi\s*ruko|nahi|na\b|no\b|nope|deny|denied|ruk\s*jao|ruko|ruk\b|cancel|mat\s*karo|mat\s*kar|mat\b|stop|reject)\b/i;
+const ALLOW_RE =
+  /\b(permission\s*di|haan\s*kar\s*do|kar\s*de|kar\s*do|theek\s*hai|theek|haan|haa|ha\b|yes\b|yep|allow|allowed|proceed|ok\b|okay|approve|approved)\b/i;
+
 export function mapVoiceDecision(text: string): "allow" | "deny" | null {
   const s = text.toLowerCase().trim();
-  if (/\b(allow|yes|yep|haan|haa|ha|kar\s*do|theek|ok|okay|approve|allowed)\b/.test(s)) return "allow";
-  if (/\b(deny|no|nope|nahi|na|mat|cancel|reject|stop)\b/.test(s)) return "deny";
+  if (!s) return null;
+  if (DENY_RE.test(s)) return "deny";
+  if (ALLOW_RE.test(s)) return "allow";
   return null;
 }
