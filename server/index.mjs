@@ -374,7 +374,11 @@ export async function handleRequest(req, res) {
       );
       if (!out.ok) return send(res, 502, { ok: false, error: "ttsFailed", message: out.error, hint: out.hint ?? "pip install edge-tts" });
       log.info("tts", `synthesised ${out.bytes}B via ${out.engine}${out.cached ? " (cache)" : ""} in ${Date.now() - t0}ms`);
-      return send(res, 200, { ...out, url: `/api/media/${basename(out.file)}` });
+      return send(res, 200, {
+        ...out,
+        url: `/api/media/${basename(out.file)}`,
+        audioUrl: `/api/media/${basename(out.file)}`,
+      });
     }
     const mediaMatch = p.match(/^\/api\/media\/([\w.-]+)$/);
     if (m === "GET" && mediaMatch) {

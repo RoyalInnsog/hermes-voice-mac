@@ -67,8 +67,9 @@ async function runVerification() {
     });
     const ttsJson = await ttsRes.json();
     if (ttsRes.status === 200 && ttsJson.ok) {
-      const audioRes = await fetch(`${baseURL}${ttsJson.audioUrl}`);
-      assert(audioRes.status === 200, `Audio stream GET ${ttsJson.audioUrl} failed`);
+      const audioPath = ttsJson.audioUrl || ttsJson.url;
+      const audioRes = await fetch(`${baseURL}${audioPath}`);
+      assert(audioRes.status === 200, `Audio stream GET ${audioPath} failed`);
       const buf = await audioRes.arrayBuffer();
       assert(buf.byteLength > 64, "Generated audio file is empty");
       console.log(`          Synthesized Hindi audio via ${ttsJson.engine} (${buf.byteLength} bytes, cached=${Boolean(ttsJson.cached)})`);
