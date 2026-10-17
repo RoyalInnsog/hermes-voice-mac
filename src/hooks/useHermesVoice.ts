@@ -8,7 +8,7 @@ import { allowsVoiceApproval, canAutoApprove } from "../lib/risk";
 import { makeBridge, type AgentBridge } from "../lib/agentBridge";
 import { BridgeClient, LocalBridge, type BridgeServerHealth, type ServerTestResult } from "../lib/localBridge";
 import { OmnirouteClient, type ProbeResult } from "../lib/omniroute";
-import { duckSystemAudio, mapVoiceDecision, restoreSystemAudio, speechify, summarizeForSpeech, WebSTTEngine, WebTTSEngine } from "../lib/speech";
+import { duckSystemAudio, mapVoiceDecision, restoreSystemAudio, speechify, summarizeForSpeech, WebSTTEngine, WebTTSEngine, ContinuousWakeDetector } from "../lib/speech";
 import { appendAudit, clearAudit, deleteSessions, loadAudit, loadSessions, loadSettings, saveSession, saveSettings } from "../lib/store";
 import { errText, type ErrorCode } from "../lib/errors";
 import { confirmTranscriptPrompt, permissionAskPrompt, t } from "../lib/strings";
@@ -118,6 +118,7 @@ export function useHermesVoice() {
   const listenStart = useRef(0);
   const maxLenTimer = useRef<number | null>(null);
   const confirmTimer = useRef<number | null>(null);
+  const wakeDetector = useRef<ContinuousWakeDetector | null>(null);
   const allowlistRef = useRef<string[]>([]);
   allowlistRef.current = sessionAllowlist;
 
@@ -957,6 +958,24 @@ export function useHermesVoice() {
   useEffect(() => {
     saveSettings(settings);
   }, [settings]);
+
+  // Continuous passive background wake-word listener ("Kriti" / "Hey Kriti")
+  useEffect(() => {
+    wakeDetector.current = new ContinuousWakeDetector(() => {
+      logger.info("stt", "Passive wake-word 'Kriti' detected — waking app & listening!");
+      void startListening();
+    });
+
+    if (state === "idle") {
+      wakeDetector.current.start();
+    } else {
+      wakeDetector.current.stop();
+    }
+
+    return () => {
+      wakeDetector.current?.stop();
+    };
+  }, [state, startListening]);
 
   /* ------------------------------- hotkeys ------------------------------- */
 

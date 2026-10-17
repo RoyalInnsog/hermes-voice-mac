@@ -30,9 +30,10 @@ def transcribe(audio_path, model_size="base", language="hi"):
             audio_path,
             beam_size=5,
             language=lang,
+            initial_prompt="Kriti, Hey Kriti, कृति, Hermes, activate, awake",
             task="transcribe",
             vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500)
+            vad_parameters=dict(min_silence_duration_ms=400)
         )
         
         text_parts = [segment.text.strip() for segment in segments]

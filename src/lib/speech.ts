@@ -456,7 +456,7 @@ export class WebSTTEngine {
         }
 
         // Wake Word "Kriti" detection: unhides HUD & wakes app
-        if (/\b(kriti|hey\s*kriti|kreeti|कृति)\b/i.test(combined)) {
+        if (/\b(kriti|hey\s*kriti|kreeti|kreetin|akreeti|akreetin|creaty|krithi|kirti|कृति|activate|awake)\b/i.test(combined)) {
           const native = getNativeBridge();
           native?.postMessage({ action: "wakeApp" });
           window.dispatchEvent(new CustomEvent("hv:wake-word", { detail: { word: "Kriti" } }));
@@ -568,4 +568,82 @@ export function mapVoiceDecision(text: string): "allowOnce" | "allowSession" | "
   if (allow) return "allowOnce";
   if (deny) return "deny";
   return null;
+}
+
+/**
+ * Continuous passive background listener for wake words ("Kriti", "Hey Kriti", "activate", "awake").
+ * Only runs when the voice agent is in "idle" state so it uses near-zero CPU and never interferes with commands.
+ */
+export class ContinuousWakeDetector {
+  private rec: AnySpeechRecognition | null = null;
+  private running = false;
+  private onWake: () => void;
+
+  constructor(onWake: () => void) {
+    this.onWake = onWake;
+  }
+
+  start() {
+    if (this.running) return;
+    const Ctor = getRecognitionCtor();
+    if (!Ctor) return;
+
+    this.running = true;
+    const startRec = () => {
+      if (!this.running) return;
+      try {
+        const rec = new Ctor();
+        rec.lang = "en-IN";
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.maxAlternatives = 1;
+
+        rec.onresult = (ev: unknown) => {
+          const e = ev as { resultIndex: number; results: ArrayLike<ArrayLike<{ transcript: string }>> };
+          let transcript = "";
+          for (let i = e.resultIndex; i < e.results.length; i++) {
+            transcript += e.results[i][0].transcript + " ";
+          }
+          if (/\b(kriti|hey\s*kriti|kreeti|kreetin|akreeti|akreetin|creaty|krithi|kirti|कृति|activate|awake)\b/i.test(transcript)) {
+            const native = getNativeBridge();
+            native?.postMessage({ action: "wakeApp" });
+            window.dispatchEvent(new CustomEvent("hv:wake-word", { detail: { word: "Kriti" } }));
+            this.stop();
+            this.onWake();
+          }
+        };
+
+        rec.onerror = () => {
+          if (this.running) {
+            setTimeout(startRec, 1200);
+          }
+        };
+
+        rec.onend = () => {
+          if (this.running) {
+            setTimeout(startRec, 400);
+          }
+        };
+
+        rec.start();
+        this.rec = rec;
+      } catch {
+        if (this.running) setTimeout(startRec, 1500);
+      }
+    };
+
+    startRec();
+  }
+
+  stop() {
+    this.running = false;
+    if (this.rec) {
+      try {
+        this.rec.abort();
+      } catch {
+        /* noop */
+      }
+      this.rec = null;
+    }
+  }
 }
