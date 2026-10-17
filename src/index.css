@@ -1,0 +1,205 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Bricolage Grotesque", "IBM Plex Sans", sans-serif;
+  --font-sans: "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+
+  --color-canvas: #e9ecf1;
+  --color-panel: #ffffff;
+  --color-sunken: #f4f6f9;
+  --color-line: #dfe4ec;
+  --color-line-soft: #eaeef4;
+
+  --color-ink: #0f1319;
+  --color-ink-2: #333c4a;
+  --color-muted: #66707f;
+  --color-faint: #98a2b1;
+
+  --color-pine: #0b6b60;
+  --color-pine-bright: #0f9c8a;
+  --color-pine-wash: #e2f2ef;
+  --color-amber: #a9650a;
+  --color-amber-wash: #fbf0dd;
+  --color-rose: #ac2340;
+  --color-rose-wash: #fbe6ea;
+  --color-indigo-ink: #2f4bd8;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    margin: 0;
+    font-family: var(--font-sans);
+    color: var(--color-ink);
+    background-color: var(--color-canvas);
+  }
+  ::selection {
+    background: #bfe6df;
+    color: #06302a;
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #c3cbd8 transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: #c3cbd8;
+    border-radius: 99px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: #a7b2c2;
+    background-clip: content-box;
+  }
+  input,
+  select,
+  textarea,
+  button {
+    font-family: inherit;
+  }
+}
+
+@layer utilities {
+  /* Layered ambient canvas: engineering grid + two slow light washes. */
+  .app-canvas {
+    background-image:
+      linear-gradient(to right, rgba(15, 19, 25, 0.035) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(15, 19, 25, 0.035) 1px, transparent 1px),
+      radial-gradient(900px 520px at 12% -8%, rgba(15, 156, 138, 0.16), transparent 62%),
+      radial-gradient(760px 460px at 92% 4%, rgba(169, 101, 10, 0.12), transparent 60%),
+      radial-gradient(700px 700px at 50% 108%, rgba(47, 75, 216, 0.08), transparent 65%);
+    background-size:
+      34px 34px,
+      34px 34px,
+      auto,
+      auto,
+      auto;
+  }
+
+  .panel {
+    background: var(--color-panel);
+    border: 1px solid var(--color-line);
+    border-radius: 14px;
+    box-shadow:
+      0 1px 1px rgba(15, 19, 25, 0.03),
+      0 12px 28px -22px rgba(15, 19, 25, 0.45);
+  }
+
+  .panel-flat {
+    background: var(--color-sunken);
+    border: 1px solid var(--color-line-soft);
+    border-radius: 10px;
+  }
+
+  .hairline {
+    border-color: var(--color-line-soft);
+  }
+
+  .label-xs {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--color-faint);
+  }
+
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .reveal {
+    animation: reveal 0.32s cubic-bezier(0.22, 0.8, 0.28, 1) both;
+  }
+  .rise {
+    animation: rise 0.26s cubic-bezier(0.22, 0.8, 0.28, 1) both;
+  }
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes orb-pulse {
+  0% {
+    transform: scale(0.92);
+    opacity: 0.55;
+  }
+  70% {
+    transform: scale(1.28);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1.28);
+    opacity: 0;
+  }
+}
+
+@keyframes sheen {
+  0% {
+    transform: translateX(-120%) rotate(8deg);
+  }
+  100% {
+    transform: translateX(220%) rotate(8deg);
+  }
+}
+
+@keyframes bar-dance {
+  0%,
+  100% {
+    transform: scaleY(0.25);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+.orb-ring {
+  animation: orb-pulse 2.1s cubic-bezier(0.24, 0.6, 0.3, 1) infinite;
+}
+.orb-ring-2 {
+  animation: orb-pulse 2.1s cubic-bezier(0.24, 0.6, 0.3, 1) infinite 0.7s;
+}
+.sheen::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.5) 50%, transparent 80%);
+  animation: sheen 2.6s ease-in-out infinite;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orb-ring,
+  .orb-ring-2,
+  .sheen::after,
+  .reveal,
+  .rise {
+    animation: none !important;
+  }
+}
