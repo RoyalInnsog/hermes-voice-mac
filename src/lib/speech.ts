@@ -188,7 +188,7 @@ function getRecognitionCtor(): (new () => AnySpeechRecognition) | null {
 }
 
 const FALLBACK_LOCALES = ["en-IN", "en-US", "hi-IN"] as const;
-const SILENCE_AUTO_STOP_MS = 1800; // 1.8s silence auto-stop per spec §2.4
+const SILENCE_AUTO_STOP_MS = 1000; // Fast 1.0s cutoff after speech ends (cooler-proof)
 
 export class WebSTTEngine {
   private rec: AnySpeechRecognition | null = null;
@@ -199,9 +199,13 @@ export class WebSTTEngine {
   private bestConfidence = 0;
   private stream: MediaStream | null = null;
   private audioCtx: AudioContext | null = null;
+  private biquadFilter: BiquadFilterNode | null = null;
   private raf = 0;
   private silenceTimer: number | null = null;
   private hasSpoken = false;
+  private noiseFloor = 0.035;
+  private noiseSamples = 0;
+  private noiseSum = 0;
   listening = false;
 
   static supported(): boolean {
@@ -225,17 +229,35 @@ export class WebSTTEngine {
     }, SILENCE_AUTO_STOP_MS);
   }
 
-  /** Mic level meter — Section 6.3 AudioLevelMeter (RMS for the waveform + energy silence reset). */
+  /** Mic level meter — with High-Pass Filter (<280Hz) to kill cooler motor hum & adaptive noise gate. */
   private async startMeter(onLevel: (rms: number) => void) {
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
       const Ctx = (window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext) as typeof AudioContext;
       this.audioCtx = new Ctx();
       const src = this.audioCtx.createMediaStreamSource(this.stream);
+
+      // High-pass filter cuts off cooler motor/fan hum (< 280Hz)
+      this.biquadFilter = this.audioCtx.createBiquadFilter();
+      this.biquadFilter.type = "highpass";
+      this.biquadFilter.frequency.value = 280;
+
       const analyser = this.audioCtx.createAnalyser();
       analyser.fftSize = 512;
-      src.connect(analyser);
+      src.connect(this.biquadFilter);
+      this.biquadFilter.connect(analyser);
+
       const buf = new Uint8Array(analyser.frequencyBinCount);
+      this.noiseFloor = 0.035;
+      this.noiseSamples = 0;
+      this.noiseSum = 0;
+
       const tick = () => {
         analyser.getByteTimeDomainData(buf);
         let sum = 0;
@@ -244,8 +266,19 @@ export class WebSTTEngine {
           sum += v * v;
         }
         const rms = Math.sqrt(sum / buf.length);
+
+        // Calibrate ambient noise floor for first 30 frames (~500ms)
+        if (this.noiseSamples < 30) {
+          this.noiseSamples++;
+          this.noiseSum += rms;
+          this.noiseFloor = Math.max(0.02, this.noiseSum / this.noiseSamples);
+        }
+
         onLevel(rms);
-        if (this.hasSpoken && rms > 0.045) {
+
+        // Only reset silence timer if energy is significantly above the cooler noise floor
+        const voiceThreshold = this.noiseFloor + 0.065;
+        if (this.hasSpoken && rms > voiceThreshold) {
           this.resetSilenceTimer();
         }
         this.raf = requestAnimationFrame(tick);
@@ -404,6 +437,14 @@ export class WebSTTEngine {
           this.hasSpoken = true;
           this.resetSilenceTimer();
         }
+
+        // Wake Word "Kriti" detection: unhides HUD & wakes app
+        if (/\b(kriti|hey\s*kriti|kreeti|कृति)\b/i.test(combined)) {
+          const native = getNativeBridge();
+          native?.postMessage({ action: "wakeApp" });
+          window.dispatchEvent(new CustomEvent("hv:wake-word", { detail: { word: "Kriti" } }));
+        }
+
         cb.onPartial(combined);
       };
 

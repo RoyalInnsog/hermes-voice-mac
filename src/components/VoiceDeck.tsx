@@ -3,6 +3,7 @@ import type { Orchestrator } from "../hooks/useHermesVoice";
 import { stateCopy, t } from "../lib/strings";
 import type { StateName } from "../lib/stateMachine";
 import { Badge, Button, Kbd } from "./ui";
+import { JarvisHUD } from "./JarvisHUD";
 import { cn } from "../utils/cn";
 
 const STATE_TONE: Record<StateName, { ring: string; text: string; glow: string; label: string }> = {
@@ -231,33 +232,27 @@ export function VoiceDeck({
           </span>
         </div>
 
-        <div className="mt-3 flex flex-col items-center">
-          <VoiceOrb o={o} tone={tone} />
+        <div className="mt-2 flex flex-col items-center w-full">
+          {/* Iron Man / Jarvis Holographic Reactor & Telemetry HUD */}
+          <JarvisHUD o={o} />
 
-          <div className="-mt-0.5 text-center">
-            <div className="font-display text-[24px] font-800 leading-tight tracking-[-0.02em]" style={{ color: tone.text }}>
+          <div className="mt-1 flex items-center justify-center">
+            <VoiceOrb o={o} tone={tone} />
+          </div>
+
+          <div className="mt-1 text-center">
+            <div className="font-display text-[22px] font-800 leading-tight tracking-[-0.02em]" style={{ color: tone.text }}>
               {stateCopy(o.state, o.settings.lang)}
             </div>
             <div className="mt-0.5 font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--color-muted)]">
               {o.state === "listening"
-                ? "speak naturally · auto-sends after 1.8s silence"
+                ? "speak naturally · 280Hz cooler noise filter active"
                 : o.state === "awaitingPermission"
                   ? "say 'haan allow' or 'nahi deny'"
                   : o.speakingNow || o.state === "speaking"
-                    ? "tap orb or ⌥Space to barge-in"
-                    : "tap orb or hold ⌥Space to speak"}
+                    ? "tap mic or ⌥Space to barge-in"
+                    : "say 'Kriti' or tap orb / ⌥Space"}
             </div>
-          </div>
-
-          <div className="mt-3 w-full">
-            <CanvasWaveform
-              inputLevel={o.level}
-              playbackLevel={o.playbackLevel}
-              listening={o.state === "listening"}
-              speaking={o.speakingNow || o.state === "speaking"}
-              thinking={o.state === "thinking"}
-              color={tone.ring}
-            />
           </div>
         </div>
 

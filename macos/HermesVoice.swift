@@ -392,6 +392,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             duckSystemVolume()
         case "restoreAudio":
             restoreSystemVolume()
+        case "wakeApp":
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKeyAndOrderFront(nil)
         case "startNativeSTT":
             let locale = (body["locale"] as? String) ?? "en-IN"
             startNativeSTT(localeId: locale)
