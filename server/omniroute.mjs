@@ -1,24 +1,23 @@
-// server/omniroute.mjs — Hermes Voice v1.0 STRICT READ-ONLY OmniRoute client (Spec §0.6 & §1.4).
+// server/omniroute.mjs — READ-ONLY Omniroute client (spec §6.6 / §10.2, v1.0).
 //
-// CRITICAL RULES enforced structurally:
-//   • Only GET requests + one non-mutating POST probe (/v1/chat/completions with stream:false)
-//   • Never PUT / PATCH / DELETE anything on 127.0.0.1:20128
-//   • Never stop, restart, or kill OmniRoute
-//   • SQLite inspection uses `sqlite3 -readonly` ONLY on combos & provider metadata (never writes, never reads apiKeys)
+// HARD RULES enforced structurally, not by comment:
+//   • the only HTTP methods exposed are GET-shaped + one non-mutating probe POST
+//   • there is no code path that can PUT/PATCH/DELETE anything
+//   • nothing here can stop, restart or reconfigure the gateway
+//   • the probe always sends stream:false (SSE would break JSON.parse)
+//   • SQLite inspection of ~/.9router/db/data.sqlite is strictly READ-ONLY (mode=ro / -readonly)
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { redact } from "./redact.mjs";
-
-const DEFAULT_SQLITE = join(homedir(), ".9router", "db", "data.sqlite");
+import { resolvePython } from "./config.mjs";
 
 export class OmnirouteClient {
-  constructor(baseURL, log, sqlitePath = DEFAULT_SQLITE) {
+  constructor(baseURL, log, opts = {}) {
     this.baseURL = String(baseURL).replace(/\/+$/, "");
-    this.sqlitePath = sqlitePath;
     this.log = log ?? { info() {}, warn() {}, error() {}, debug() {} };
+    this.sqlitePath = opts.sqlitePath ?? null;
   }
 
   url(path) {
@@ -30,11 +29,7 @@ export class OmnirouteClient {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const res = await fetch(this.url(path), {
-        method: "GET",
-        headers: { Accept: "application/json" },
-        signal: ctrl.signal,
-      });
+      const res = await fetch(this.url(path), { method: "GET", headers: { Accept: "application/json" }, signal: ctrl.signal });
       const ms = Date.now() - t0;
       const text = await res.text();
       let body = text;
@@ -56,14 +51,7 @@ export class OmnirouteClient {
         const { status, body, ms } = await this.#get(path, 4000);
         if (status >= 200 && status < 300) {
           const version = body && typeof body === "object" ? (body.version ?? null) : null;
-          return {
-            reachable: true,
-            latencyMs: ms,
-            version: version ? String(version) : null,
-            checkedAt: Date.now(),
-            path,
-            status,
-          };
+          return { reachable: true, latencyMs: ms, version: version ? String(version) : null, checkedAt: Date.now(), path, status };
         }
       } catch (e) {
         this.log.debug("router", `health probe ${path} failed: ${e.message}`);
@@ -81,23 +69,21 @@ export class OmnirouteClient {
   }
 
   /**
-   * Read-only combo discovery:
-   *   1. Probes HTTP /api/combos, /v1/combos, /combos
-   *   2. Falls back to read-only SQLite inspection of ~/.9router/db/data.sqlite (table `combos`)
+   * Read-only combo discovery via HTTP endpoints with optional read-only SQLite fallback
+   * against ~/.9router/db/data.sqlite.
    */
-  async combos() {
+  async combos(opts = {}) {
     for (const path of ["/api/combos", "/v1/combos", "/combos"]) {
       try {
-        const { status, body } = await this.#get(path, 3500);
+        const { status, body } = await this.#get(path, 4000);
         if (status < 200 || status >= 300 || !body || typeof body !== "object") continue;
-        const arr = Array.isArray(body) ? body : body.data;
+        const arr = Array.isArray(body) ? body : body.data ?? body.combos;
         if (!Array.isArray(arr)) continue;
         return {
           pathUsed: path,
-          source: "http",
           combos: arr.map((c) => ({
             name: String(c?.name ?? c?.id ?? "unnamed"),
-            models: parseModelsField(c?.models ?? c?.modelList ?? []),
+            models: Array.isArray(c?.models) ? c.models.map(String) : [],
           })),
         };
       } catch {
@@ -105,96 +91,85 @@ export class OmnirouteClient {
       }
     }
 
-    const sqliteRes = await this.inspectSqliteReadOnly();
-    if (sqliteRes.available && sqliteRes.combos.length > 0) {
-      return {
-        pathUsed: `sqlite:${this.sqlitePath}#combos`,
-        source: "sqlite-readonly",
-        combos: sqliteRes.combos,
-      };
+    const dbPath = opts.sqlitePath ?? this.sqlitePath;
+    if (dbPath && existsSync(dbPath)) {
+      const sqliteCombos = await this.inspectSqliteReadOnly(dbPath);
+      if (sqliteCombos && sqliteCombos.length > 0) {
+        return {
+          pathUsed: `sqlite:${dbPath} (read-only)`,
+          combos: sqliteCombos,
+        };
+      }
     }
 
-    return { pathUsed: null, source: "none", combos: [] };
+    return { pathUsed: null, combos: [] };
   }
 
   /**
-   * Strict read-only SQLite inspection of ~/.9router/db/data.sqlite.
-   * Uses `sqlite3 -readonly -json` and redacts all returned text.
-   * NEVER touches `apiKeys` and NEVER executes any write statement.
+   * Strict read-only inspection of ~/.9router/db/data.sqlite using URI mode=ro.
+   * Never opens the database with write permissions, never acquires write locks.
    */
-  async inspectSqliteReadOnly() {
-    if (!this.sqlitePath || !existsSync(this.sqlitePath)) {
-      return {
-        available: false,
-        path: this.sqlitePath,
-        reason: "SQLite file not present on this host",
-        combos: [],
-        providers: [],
-      };
-    }
+  async inspectSqliteReadOnly(dbPath = join(homedir(), ".9router/db/data.sqlite")) {
+    if (!existsSync(dbPath)) return null;
+    const pyBin = resolvePython();
+    const pyScript = `
+import sqlite3, json, sys
+db_path = sys.argv[1]
+uri = f"file:{db_path}?mode=ro"
+try:
+    conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    combos = []
+    for t in tables:
+        tl = t.lower()
+        if "combo" in tl or "route" in tl or "model" in tl:
+            try:
+                rows = cur.execute(f'SELECT * FROM "{t}" LIMIT 50').fetchall()
+                for row in rows:
+                    d = dict(row)
+                    name = d.get("name") or d.get("combo_name") or d.get("id") or d.get("slug")
+                    models_raw = d.get("models") or d.get("providers") or d.get("targets") or d.get("model_list") or "[]"
+                    if name:
+                        try:
+                            parsed_m = json.loads(models_raw) if isinstance(models_raw, str) else models_raw
+                            if isinstance(parsed_m, list):
+                                models = [str(x.get("model") or x.get("id") or x) if isinstance(x, dict) else str(x) for x in parsed_m]
+                            else:
+                                models = [str(models_raw)]
+                        except Exception:
+                            models = [s.strip() for s in str(models_raw).split(",") if s.strip()]
+                        combos.append({"name": str(name), "models": models})
+            except Exception:
+                pass
+    conn.close()
+    print(json.dumps(combos))
+except Exception as e:
+    print("[]")
+`.trim();
 
-    const queryJson = (sql) =>
-      new Promise((res) => {
-        if (!/^\s*SELECT\b/i.test(sql)) {
-          return res({ ok: false, rows: [], err: "blocked non-SELECT query" });
+    return new Promise((res) => {
+      execFile(pyBin, ["-c", pyScript, dbPath], { timeout: 4000 }, (err, stdout) => {
+        if (err || !stdout) return res(null);
+        try {
+          const parsed = JSON.parse(stdout.trim());
+          return res(Array.isArray(parsed) ? parsed : null);
+        } catch {
+          return res(null);
         }
-        execFile(
-          "sqlite3",
-          ["-readonly", "-json", this.sqlitePath, sql],
-          { timeout: 4000 },
-          (err, stdout) => {
-            if (err) return res({ ok: false, rows: [], err: err.message });
-            try {
-              const rows = JSON.parse(stdout.trim() || "[]");
-              return res({ ok: true, rows: Array.isArray(rows) ? rows : [] });
-            } catch (e) {
-              return res({ ok: false, rows: [], err: e.message });
-            }
-          },
-        );
       });
-
-    const [combosQ, provQ] = await Promise.all([
-      queryJson("SELECT * FROM combos LIMIT 50;"),
-      queryJson("SELECT id, provider, name, isActive, status, createdAt FROM providerConnections LIMIT 100;"),
-    ]);
-
-    const combos = (combosQ.rows || []).map((row) => ({
-      name: String(row.name ?? row.comboName ?? row.id ?? "unnamed"),
-      models: parseModelsField(row.models ?? row.model_list ?? row.config ?? []),
-    }));
-
-    const providers = (provQ.rows || []).map((row) => ({
-      id: redact(String(row.id ?? "")),
-      provider: redact(String(row.provider ?? "unknown")),
-      name: redact(String(row.name ?? "")),
-      active: Boolean(row.isActive ?? row.status === "active" ?? true),
-      status: redact(String(row.status ?? "ok")),
-    }));
-
-    return {
-      available: combosQ.ok || provQ.ok,
-      path: this.sqlitePath,
-      readOnly: true,
-      combos,
-      providers,
-      error: !combosQ.ok && !provQ.ok ? combosQ.err : null,
-    };
+    });
   }
 
-  /** Non-mutating chat probe. stream:false is mandatory (Spec §3.2). */
+  /** Non-mutating chat probe. stream:false is mandatory. */
   async chatProbe(model) {
     const t0 = Date.now();
     try {
       const res = await fetch(this.url("/v1/chat/completions"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: "user", content: "ping" }],
-          stream: false,
-          max_tokens: 16,
-        }),
+        body: JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], stream: false, max_tokens: 16 }),
         signal: AbortSignal.timeout(30000),
       });
       const ms = Date.now() - t0;
@@ -202,12 +177,7 @@ export class OmnirouteClient {
       if (!res.ok) return { ok: false, latencyMs: ms, model, error: `HTTP ${res.status}: ${text.slice(0, 200)}` };
       try {
         const j = JSON.parse(text);
-        return {
-          ok: true,
-          latencyMs: ms,
-          model,
-          sample: String(j?.choices?.[0]?.message?.content ?? "").slice(0, 200),
-        };
+        return { ok: true, latencyMs: ms, model, sample: String(j?.choices?.[0]?.message?.content ?? "").slice(0, 200) };
       } catch {
         return { ok: false, latencyMs: ms, model, error: "non-JSON body — server streamed SSE despite stream:false" };
       }
@@ -215,17 +185,4 @@ export class OmnirouteClient {
       return { ok: false, latencyMs: Date.now() - t0, model, error: e.message };
     }
   }
-}
-
-function parseModelsField(raw) {
-  if (Array.isArray(raw)) return raw.map((x) => (typeof x === "string" ? x : String(x?.model ?? x?.id ?? "")));
-  if (typeof raw === "string" && raw.trim()) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parseModelsField(parsed);
-    } catch {
-      return raw.split(",").map((s) => s.trim()).filter(Boolean);
-    }
-  }
-  return [];
 }

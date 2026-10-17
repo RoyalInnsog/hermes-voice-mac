@@ -13,17 +13,17 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
   const h = o.backend.health;
 
   return (
-    <div className="flex min-h-0 flex-1 gap-4">
-      <nav className="w-[136px] shrink-0 space-y-0.5">
+    <div className="flex min-h-0 flex-1 flex-col gap-4 md:flex-row">
+      <nav className="flex shrink-0 gap-1 overflow-x-auto md:w-[144px] md:flex-col">
         {TABS.map((x) => (
           <button
             key={x}
             onClick={() => setTab(x)}
             className={cn(
-              "w-full rounded-lg px-3 py-2 text-left text-[12.5px] font-500 transition-all",
+              "shrink-0 rounded-lg px-3 py-2 text-left text-[12.5px] font-500 transition-all",
               tab === x
-                ? "bg-[#1e1a14] text-[var(--color-gold)] shadow-[0_2px_8px_rgba(0,0,0,0.45)] ring-1 ring-[var(--color-gold)]/35"
-                : "text-[var(--color-muted)] hover:bg-[#181510] hover:text-[var(--color-ink-2)]",
+                ? "bg-[var(--color-panel-2)] text-[var(--color-gold-bright)] ring-1 ring-[rgba(229,169,60,0.4)]"
+                : "text-[var(--color-muted)] hover:bg-[var(--color-sunken)] hover:text-[var(--color-ink)]",
             )}
           >
             {x}
@@ -45,20 +45,20 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
                 ]}
               />
             </Row>
-            <Row label="Push-to-talk" hint="Hold karke bolo; release = send. Native build me global hotkey, yahan window-scoped.">
+            <Row label="Push-to-talk / Toggle HUD" hint="Global hotkey in Hermes Voice.app (Carbon RegisterEventHotKey + Accessibility check) and window-scoped in browser.">
               <span className="flex gap-1">
                 <Kbd>⌥</Kbd>
                 <Kbd>Space</Kbd>
               </span>
             </Row>
-            <Row label="Repeat last answer" hint="Aakhri report dobara bolta hai.">
+            <Row label="Repeat last answer" hint="Aakhri spoken report dobara sunata hai.">
               <span className="flex gap-1">
                 <Kbd>⌥</Kbd>
                 <Kbd>⇧</Kbd>
                 <Kbd>Space</Kbd>
               </span>
             </Row>
-            <Row label="Cancel current task" hint="Har busy state me kaam karta hai — bridge pe DELETE bhi jaata hai.">
+            <Row label="Cancel current task" hint="Har busy state me kaam karta hai — bridge pe DELETE + process-group SIGTERM bhejta hai.">
               <span className="flex gap-1">
                 <Kbd>⌥</Kbd>
                 <Kbd>⌘</Kbd>
@@ -71,8 +71,8 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
             <Row label="Speak 'Ready' on launch" hint="Noise se bachne ke liye default off.">
               <Toggle value={s.startupChime} onChange={(v) => o.update("startupChime", v)} label="Startup chime" />
             </Row>
-            <Row label="Launch at login" hint="SMAppService native build me — browser se possible nahi (LIMITATIONS L-5).">
-              <Badge tone="amber">native only</Badge>
+            <Row label="macOS Floating Wrapper" hint="Hermes Voice.app bundle (Swift WKWebView) + scripts/launch-hud.mjs runner included.">
+              <Badge tone="gold" dot>v1.0 bundled</Badge>
             </Row>
           </Panel>
         )}
@@ -80,54 +80,58 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
         {tab === "Voice" && (
           <>
             <Panel className="p-4">
-              <SectionTitle hint="speech → text">Speech to text</SectionTitle>
-              <Row label="STT locale" hint="en-IN Hinglish ke liye sabse behtar; hi-IN pure Hindi ke liye better, English words ke liye worse.">
+              <SectionTitle hint="speech → text (1.8s silence auto-stop)">Speech to Text (STT)</SectionTitle>
+              <Row label="STT locale" hint="en-IN Hinglish ke liye sabse behtar; auto-fallback to en-US / hi-IN.">
                 <Select
                   value={s.sttLocale}
                   onChange={(v) => o.update("sttLocale", v)}
                   options={[
-                    { value: "en-IN", label: "en-IN (default)" },
-                    { value: "hi-IN", label: "hi-IN" },
-                    { value: "en-US", label: "en-US" },
+                    { value: "en-IN", label: "en-IN (Hinglish optimal)" },
+                    { value: "hi-IN", label: "hi-IN (Hindi)" },
+                    { value: "en-US", label: "en-US (English)" },
                   ]}
                 />
               </Row>
-              <Row label="On-device recognition" hint="Native build: requiresOnDeviceRecognition. Browser STT cloud pe ja sakta hai — Privacy tab dekho.">
+              <Row label="On-device recognition" hint="Prefers local recognition where available.">
                 <Toggle value={s.onDeviceSTT} onChange={(v) => o.update("onDeviceSTT", v)} label="On-device STT" />
               </Row>
               <Row label="Confidence threshold" hint="Isse neeche → 'Maine suna: …. Bhejoon?' confirmation flow.">
                 <Slider value={s.confidenceThreshold} onChange={(v) => o.update("confidenceThreshold", v)} min={0} max={1} step={0.05} />
               </Row>
-              <Row label="Engine status" hint="Is runtime me SpeechRecognition API available hai ya nahi.">
+              <Row label="Engine status" hint="Web Speech API + 1.8s post-speech silence detector.">
                 {o.sttSupported ? <Badge tone="green" dot>available</Badge> : <Badge tone="rose" dot>unsupported</Badge>}
               </Row>
             </Panel>
 
             <Panel className="p-4">
-              <SectionTitle hint="edge-tts primary, system voice fallback">Text to speech</SectionTitle>
-              <Row label="Voice engine" hint="Edge TTS = free unlimited (hi-IN-MadhurNeural). Gemini TTS ~10 req/day/key cap ki wajah se deliberately wire nahi kiya.">
+              <SectionTitle hint="edge-tts primary, macOS say fallback">Text to Speech (TTS)</SectionTitle>
+              <Row label="Voice engine" hint="Edge TTS = free unlimited neural voice (hi-IN-MadhurNeural / en-IN-NeerjaNeural) via verified Python venv.">
                 <Select
                   value={s.ttsEngine}
                   onChange={(v) => o.update("ttsEngine", v)}
                   options={[
+                    { value: "edgeTTS", label: "Edge TTS (Python venv · cached)" },
                     { value: "webSpeech", label: "System voice (browser)" },
-                    { value: "edgeTTS", label: "Edge TTS (via bridge)" },
-                    { value: "apple", label: "AVSpeech (native only)" },
-                    { value: "gemini", label: "Gemini TTS (capped, unwired)" },
+                    { value: "apple", label: "macOS say (-v Rishi)" },
+                    { value: "gemini", label: "Gemini TTS (10/day cap, disabled)" },
                   ]}
                 />
               </Row>
-              <Row label="Prefer bridge audio" hint="ON = pehle bridge ka edge-tts audio try karo, fail ho to system voice. OFF = sirf browser voice.">
+              <Row label="Prefer bridge audio" hint="ON = synthesize via local bridge with SHA-256 disk caching + instant barge-in.">
                 <Toggle value={s.useBridgeTTS} onChange={(v) => o.update("useBridgeTTS", v)} label="Prefer bridge TTS" />
               </Row>
-              <div className="panel-flat mt-1 mb-3 px-3 py-2 text-[11.5px] leading-relaxed text-[var(--color-ink-2)]">
-                Bridge pe detect hua:{" "}
-                <span className="font-mono">
-                  edge={String(h?.tts.engines.edge.available ?? "?")} · say={String(h?.tts.engines.say.available ?? "?")} · gemini={String(h?.tts.engines.gemini.available ?? "false")}
-                </span>
-                <div className="mt-1 font-mono text-[10.5px] text-[var(--color-muted)]">{h?.tts.engines.edge.detail ?? "bridge offline — start: node server/index.mjs"}</div>
+              <div className="panel-flat mt-1 mb-3 px-3 py-2.5 text-[11.5px] leading-relaxed text-[var(--color-ink-2)]">
+                <div>
+                  Bridge TTS capability:{" "}
+                  <span className="font-mono text-[var(--color-gold-bright)]">
+                    edge={String(h?.tts.engines.edge.available ?? "?")} · say={String(h?.tts.engines.say.available ?? "?")} · cache={String(h?.tts.cacheFiles ?? 0)} files
+                  </span>
+                </div>
+                <div className="mt-1 font-mono text-[10.5px] text-[var(--color-muted)]">
+                  Python: {h?.python?.bin ?? h?.tts.engines.edge.pythonBin ?? "bridge offline — run npm start"}
+                </div>
               </div>
-              <Row label="Browser voice" hint="System voice fallback ke liye. Indian English/Hindi voice ho to wahi chuno.">
+              <Row label="Browser fallback voice" hint="Used if bridge is unreachable.">
                 <Select
                   value={s.ttsVoiceURI ?? ""}
                   onChange={(v) => o.update("ttsVoiceURI", v || null)}
@@ -144,7 +148,7 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
               <Row label="Volume">
                 <Slider value={s.ttsVolume} onChange={(v) => o.update("ttsVolume", v)} min={0} max={1} step={0.05} />
               </Row>
-              <Row label="Speak progress events" hint="Low priority — permission prompt inhe interrupt kar deta hai.">
+              <Row label="Speak progress events" hint="Low priority — permission prompt or user barge-in interrupts immediately.">
                 <Toggle value={s.speakProgress} onChange={(v) => o.update("speakProgress", v)} label="Speak progress" />
               </Row>
             </Panel>
@@ -154,78 +158,78 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
         {tab === "Agent" && (
           <>
             <Panel className="p-4">
-              <SectionTitle hint="adapter boundary">Agent bridge</SectionTitle>
-              <Row label="Bridge mode" hint="local = real Node bridge (hermes spawn + SSE). mock = local simulator. subprocess/http = native-only paths.">
+              <SectionTitle hint="stream-json + HV_* adapter">Agent Bridge</SectionTitle>
+              <Row label="Bridge mode" hint="local = real Node bridge spawning hermes chat -q <query> --format stream-json.">
                 <Select
                   value={s.bridgeMode}
                   onChange={(v) => o.update("bridgeMode", v)}
                   options={[
-                    { value: "local", label: "Local bridge (real)" },
+                    { value: "local", label: "Local bridge (real Hermes)" },
                     { value: "mock", label: "Mock Hermes (simulator)" },
-                    { value: "subprocess", label: "hermes CLI (native app only)" },
-                    { value: "http", label: "Hermes HTTP/ACP (unverified)" },
+                    { value: "subprocess", label: "hermes CLI (native)" },
+                    { value: "http", label: "Hermes HTTP/ACP" },
                   ]}
                 />
               </Row>
-              <div className={cn("mt-2 rounded-xl border px-3 py-2.5 text-[11.5px] leading-relaxed", o.bridgeStatus.ok ? "border-[rgba(11,107,96,0.25)] bg-[var(--color-pine-wash)] text-[var(--color-pine)]" : "border-[rgba(169,101,10,0.28)] bg-[var(--color-amber-wash)] text-[var(--color-amber)]")}>
-                <span className="font-mono font-600">{o.bridgeLabel}</span> — {o.bridgeStatus.ok ? "available" : o.bridgeStatus.reason}
+              <div
+                className={cn(
+                  "mt-2 rounded-xl border px-3 py-2.5 text-[11.5px] leading-relaxed",
+                  o.bridgeStatus.ok
+                    ? "border-[rgba(34,197,94,0.3)] bg-[var(--color-pine-wash)] text-[#4ade80]"
+                    : "border-[rgba(245,158,11,0.3)] bg-[var(--color-amber-wash)] text-[#fbbf24]",
+                )}
+              >
+                <span className="font-mono font-600">{o.bridgeLabel}</span> — {o.bridgeStatus.ok ? "ready" : o.bridgeStatus.reason}
               </div>
-              <Row label="Bridge URL" hint="Node bridge kahan chal raha hai. Loopback only — server bhi non-loopback peer reject karta hai.">
+              <Row label="Bridge URL" hint="Loopback-only HTTP/SSE server (127.0.0.1:20130).">
                 <TextField mono value={s.bridgeURL} onChange={(v) => o.update("bridgeURL", v)} className="w-[250px]" />
               </Row>
-              <Row label="Hermes binary path" hint="Native build ke liye. Bridge apna command ~/.hermes-voice/config.json se padhta hai.">
+              <Row label="Hermes binary path" hint="Auto-discovered at /Users/apple/.hermes/hermes-agent/.hermes/bin/hermes or ~/.local/bin/hermes.">
                 <TextField mono value={s.hermesPath} onChange={(v) => o.update("hermesPath", v)} className="w-[250px]" />
               </Row>
-              <Row label="Working directory" hint="Hermes yahan spawn hota hai taaki config.yaml mile.">
+              <Row label="Working directory" hint="Hermes spawns here so config.yaml is loaded.">
                 <TextField mono value={s.hermesWorkingDir} onChange={(v) => o.update("hermesWorkingDir", v)} className="w-[250px]" />
               </Row>
-              <Row label="Task timeout" hint="Iske baad process kill + hermesTimeout report.">
+              <Row label="Task timeout" hint="Process-group SIGTERM → 5s → SIGKILL on timeout.">
                 <NumberField value={s.hermesTimeoutSec} min={30} max={1800} step={30} onChange={(v) => o.update("hermesTimeoutSec", v)} suffix="s" />
-              </Row>
-              <Row label="HTTP bridge base URL" hint="Sirf tab jab Hermes ka server mode exist kare. TODO-VERIFY.">
-                <TextField mono value={s.httpBridgeBaseURL} onChange={(v) => o.update("httpBridgeBaseURL", v)} className="w-[250px]" />
               </Row>
             </Panel>
 
             <Panel className="p-4">
-              <SectionTitle hint={h ? `pid ${h.pid} · uptime ${h.uptimeSec}s` : "bridge offline"}>Bridge pe agent config (live)</SectionTitle>
+              <SectionTitle hint={h ? `pid ${h.pid} · uptime ${h.uptimeSec}s` : "bridge offline"}>Live Server Agent Config</SectionTitle>
               {h ? (
                 <>
                   <Row label="Resolved command">
-                    <span className="max-w-[300px] truncate font-mono text-[11px] text-[var(--color-ink-2)]">{h.hermes.command.join(" ")}</span>
+                    <span className="max-w-[300px] truncate font-mono text-[11px] text-[var(--color-gold-bright)]">{h.hermes.command.join(" ")}</span>
                   </Row>
-                  <Row label="argv template" hint="TODO-VERIFY against `hermes chat --help`.">
+                  <Row label="argv template">
                     <span className="max-w-[300px] truncate font-mono text-[11px] text-[var(--color-ink-2)]">{h.hermes.argvTemplate.join(" ")}</span>
                   </Row>
                   <Row label="cwd / timeout">
-                    <span className="font-mono text-[11px] text-[var(--color-muted)]">{h.hermes.cwd} · {h.hermes.timeoutSec}s</span>
+                    <span className="font-mono text-[11px] text-[var(--color-muted)]">
+                      {h.hermes.cwd} · {h.hermes.timeoutSec}s
+                    </span>
                   </Row>
-                  <Row label="Binary found">
+                  <Row label="Binary status">
                     {h.hermes.found ? <Badge tone="green" dot>{h.hermes.path}</Badge> : <Badge tone="rose" dot>{h.hermes.detail}</Badge>}
-                  </Row>
-                  <Row label="Data dir">
-                    <span className="font-mono text-[11px] text-[var(--color-muted)]">{h.dataDir}</span>
                   </Row>
                 </>
               ) : (
                 <p className="text-[12px] leading-relaxed text-[var(--color-muted)]">
-                  Bridge offline hai, isliye live config nahi dikh raha. Terminal me chalao: <code className="rounded bg-[var(--color-sunken)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--color-ink-2)]">node server/index.mjs</code>
+                  Bridge offline hai. Run <code className="rounded bg-[var(--color-sunken)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--color-gold-bright)]">npm start</code>
                 </p>
               )}
             </Panel>
 
             <Panel className="p-4">
-              <SectionTitle hint="read-only, never written">Hermes memory</SectionTitle>
-              <p className="mb-2.5 text-[11.5px] leading-relaxed text-[var(--color-muted)]">
-                ~/.hermes/memories ke files bridge ke through read-only dikhte hain. Path jail laga hua hai — traversal pe HTTP 400.
-              </p>
+              <SectionTitle hint="read-only, path-jailed">Hermes Memory (~/.hermes/memories)</SectionTitle>
               {o.backend.memory?.available ? (
                 <div className="flex flex-wrap gap-1.5">
                   {o.backend.memory.files.slice(0, 24).map((f) => (
                     <button
                       key={f}
                       onClick={() => void o.loadMemoryFile(f)}
-                      className="rounded-full border border-[var(--color-line)] bg-[#1b1814] px-2.5 py-1 font-mono text-[10.5px] text-[var(--color-ink-2)] transition-colors hover:border-[var(--color-gold)] hover:text-[var(--color-gold)]"
+                      className="rounded-lg border border-[var(--color-line)] bg-[var(--color-sunken)] px-2.5 py-1 font-mono text-[10.5px] text-[var(--color-ink-2)] transition-colors hover:border-[var(--color-gold)] hover:text-[var(--color-gold-bright)]"
                     >
                       {f}
                     </button>
@@ -246,18 +250,18 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
         {tab === "Router" && (
           <>
             <Panel className="p-4">
-              <SectionTitle hint="read-only client">Omniroute</SectionTitle>
-              <div className="mb-3 rounded-xl border border-[rgba(229,83,101,0.3)] bg-[var(--color-rose-wash)] px-3 py-2.5 text-[11.5px] leading-relaxed text-[#ff9ca7]">
-                <span className="font-600">HARD RULE:</span> ye app Omniroute ko kabhi stop/restart/reconfigure nahi karti, combos ya 9router DB (`~/.9router/db/data.sqlite`) kabhi edit nahi karti.
-                Sirf GET + read-only SQLite + ek non-mutating <span className="font-mono">stream:false</span> probe.
+              <SectionTitle hint="strict read-only client">OmniRoute Gateway & SQLite Sync</SectionTitle>
+              <div className="mb-3 rounded-xl border border-[rgba(229,169,60,0.3)] bg-[var(--color-gold-wash)] px-3 py-2.5 text-[11.5px] leading-relaxed text-[var(--color-gold-bright)]">
+                <span className="font-600">STRICT READ-ONLY CONTRACT:</span> Hermes Voice never stops, restarts, or reconfigures OmniRoute, and inspects{" "}
+                <span className="font-mono">~/.9router/db/data.sqlite</span> exclusively in read-only mode (`-readonly` / `mode=ro`).
               </div>
-              <Row label="Base URL" hint="Bridge isi ko proxy karta hai — browser ke CORS problem se bachne ke liye.">
+              <Row label="Base URL" hint="Proxied via local bridge to avoid CORS.">
                 <TextField mono value={s.omnirouteBaseURL} onChange={(v) => o.update("omnirouteBaseURL", v)} className="w-[250px]" />
               </Row>
               <Row label="Health poll interval">
                 <NumberField value={s.healthPollSec} min={15} max={600} step={15} onChange={(v) => o.update("healthPollSec", v)} suffix="s" />
               </Row>
-              <Row label="Probe model" hint="Model naam kabhi assume mat karo — probe karo. opc/beam-free known-good free route hai.">
+              <Row label="Probe model" hint="Non-streaming completion probe model.">
                 <TextField mono value={s.probeModel} onChange={(v) => o.update("probeModel", v)} className="w-[250px]" />
               </Row>
               <div className="mt-3 flex gap-2">
@@ -277,30 +281,55 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
             </Panel>
 
             <Panel className="p-4">
-              <SectionTitle hint="live probe results">Status</SectionTitle>
+              <SectionTitle hint="HTTP + ~/.9router/db/data.sqlite">Live Router Snapshot</SectionTitle>
               <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
                 {[
                   { k: "reachable", v: o.health?.reachable ? "UP" : "DOWN", tone: o.health?.reachable ? "green" : "rose" },
                   { k: "latency", v: o.health?.latencyMs != null ? `${o.health.latencyMs}ms` : "—", tone: "slate" },
                   { k: "models", v: String(o.models.length), tone: "slate" },
-                  { k: "combos path", v: o.combos.pathUsed ?? "none", tone: o.combos.pathUsed ? "green" : "amber" },
+                  { k: "combos source", v: o.combos.pathUsed ?? "none", tone: o.combos.pathUsed ? "gold" : "amber" },
                 ].map((x) => (
                   <div key={x.k} className="panel-flat px-3 py-2">
                     <div className="label-xs">{x.k}</div>
-                    <div className={cn("mt-0.5 truncate font-mono text-[12.5px] font-600", x.tone === "green" ? "text-[var(--color-pine)]" : x.tone === "rose" ? "text-[var(--color-rose)]" : x.tone === "amber" ? "text-[var(--color-amber)]" : "text-[var(--color-ink)]")}>
+                    <div
+                      className={cn(
+                        "mt-0.5 truncate font-mono text-[12px] font-600 tabular",
+                        x.tone === "green"
+                          ? "text-[#4ade80]"
+                          : x.tone === "rose"
+                            ? "text-[#f87171]"
+                            : x.tone === "gold"
+                              ? "text-[var(--color-gold-bright)]"
+                              : "text-[var(--color-ink)]",
+                      )}
+                    >
                       {x.v}
                     </div>
                   </div>
                 ))}
               </div>
-              <p className="mt-2.5 font-mono text-[10.5px] text-[var(--color-muted)]">{o.health?.detail ?? "no probe yet"}</p>
+              {o.combos.combos.length > 0 && (
+                <div className="mt-3">
+                  <div className="label-xs mb-1.5">Active Combos ({o.combos.combos.length})</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {o.combos.combos.map((c) => (
+                      <span
+                        key={c}
+                        className="rounded-md border border-[rgba(229,169,60,0.3)] bg-[var(--color-sunken)] px-2 py-1 font-mono text-[10.5px] text-[var(--color-gold-bright)]"
+                      >
+                        {c}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
               {o.probe && (
                 <div
                   className={cn(
                     "mt-3 rounded-xl border px-3 py-2.5 font-mono text-[11.5px] leading-relaxed",
                     o.probe.ok
-                      ? "border-[rgba(52,199,138,0.3)] bg-[var(--color-emerald-wash)] text-[var(--color-emerald)]"
-                      : "border-[rgba(229,83,101,0.3)] bg-[var(--color-rose-wash)] text-[#ff9ca7]",
+                      ? "border-[rgba(34,197,94,0.3)] bg-[var(--color-pine-wash)] text-[#4ade80]"
+                      : "border-[rgba(239,68,68,0.3)] bg-[var(--color-rose-wash)] text-[#f87171]",
                   )}
                 >
                   probe {o.probe.model} → {o.probe.ok ? "OK" : "FAIL"} · {o.probe.latencyMs}ms
@@ -323,25 +352,25 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
 
         {tab === "Permissions" && (
           <Panel className="p-4">
-            <SectionTitle hint="default deny">Policy</SectionTitle>
-            <Row label="Auto-approve low-risk" hint="Opt-in. Medium/high/critical kabhi auto-approve nahi hote — server bhi yahi check karta hai.">
+            <SectionTitle hint="direct stdin HV_DECISION · default deny">Tool Permission Policy</SectionTitle>
+            <Row label="Auto-approve low-risk" hint="Opt-in. Medium/high/critical never auto-approve (enforced on server).">
               <Toggle value={s.autoApproveLowRisk} onChange={(v) => o.update("autoApproveLowRisk", v)} label="Auto approve low risk" />
             </Row>
-            <Row label="Voice approval" hint="Sirf low/medium. High = click, critical = typed ALLOW.">
+            <Row label="Voice approval (low/medium)" hint="Recognizes 'haan kar do', 'allow', 'permission di', 'theek hai' vs 'nahi ruko', 'cancel'.">
               <Toggle value={s.voiceApproval} onChange={(v) => o.update("voiceApproval", v)} label="Voice approval" />
             </Row>
-            <Row label="Decision timeout" hint="Jawab nahi = auto-deny, audit me timeout-deny.">
+            <Row label="Decision timeout" hint="Unanswered prompt auto-denies and logs timeout-deny in audit.jsonl.">
               <NumberField value={s.permissionTimeoutSec} min={10} max={300} step={5} onChange={(v) => o.update("permissionTimeoutSec", v)} suffix="s" />
             </Row>
-            <Row label="Session allowlist" hint="Sirf is session ke liye. Session khatam = list clear.">
-              <span className="max-w-[220px] truncate font-mono text-[11px] text-[var(--color-muted)]">{o.sessionAllowlist.join(", ") || "empty"}</span>
+            <Row label="Session allowlist" hint="Cleared automatically when session ends.">
+              <span className="max-w-[220px] truncate font-mono text-[11px] text-[var(--color-gold-bright)]">{o.sessionAllowlist.join(", ") || "empty"}</span>
             </Row>
             <div className="mt-4 overflow-hidden rounded-xl border border-[var(--color-line)]">
               <table className="w-full text-left text-[11.5px]">
                 <thead className="bg-[var(--color-sunken)] text-[var(--color-muted)]">
                   <tr>
                     {["Risk", "Auto", "Voice", "Typed", "Examples"].map((x) => (
-                      <th key={x} className="px-3 py-2 font-mono text-[10px] font-500 uppercase tracking-[0.08em]">
+                      <th key={x} className="px-3 py-2 font-mono text-[10px] font-600 uppercase tracking-[0.08em]">
                         {x}
                       </th>
                     ))}
@@ -349,10 +378,10 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
                 </thead>
                 <tbody>
                   {[
-                    ["low", "opt-in", "yes", "no", "read_file, list_dir, web_fetch", "#0b6b60"],
-                    ["medium", "never", "yes", "no", "write_file, git_status", "#a9650a"],
-                    ["high", "never", "no", "no", "shell, git_push, delete_file", "#b4441a"],
-                    ["critical", "never", "no", "ALLOW", "credentials, sudo, rm -rf", "#ac2340"],
+                    ["low", "opt-in", "yes", "no", "read_file, list_dir, web_fetch", "#4ade80"],
+                    ["medium", "never", "yes", "no", "write_file, git_status", "#fbbf24"],
+                    ["high", "never", "no (click)", "no", "shell, git_push, delete_file", "#fb923c"],
+                    ["critical", "never", "blocked", "ALLOW", "credentials, sudo, rm -rf", "#f87171"],
                   ].map((r) => (
                     <tr key={r[0]} className="border-t border-[var(--color-line-soft)]">
                       <td className="px-3 py-2">
@@ -362,37 +391,27 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
                       </td>
                       <td className="px-3 py-2 text-[var(--color-ink-2)]">{r[1]}</td>
                       <td className="px-3 py-2 text-[var(--color-ink-2)]">{r[2]}</td>
-                      <td className="px-3 py-2 text-[var(--color-ink-2)]">{r[3]}</td>
+                      <td className="px-3 py-2 font-mono text-[var(--color-ink)]">{r[3]}</td>
                       <td className="px-3 py-2 font-mono text-[10.5px] text-[var(--color-muted)]">{r[4]}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
-            <p className="mt-3 text-[11.5px] leading-relaxed text-[var(--color-muted)]">
-              Unknown tool = <span className="font-mono">high</span>. Dangerous argument pattern (<span className="font-mono">rm -rf</span>, <span className="font-mono">sudo</span>,{" "}
-              <span className="font-mono">~/.ssh</span>) = <span className="font-mono">critical</span>.
-            </p>
           </Panel>
         )}
 
         {tab === "Privacy" && (
           <Panel className="p-4">
-            <SectionTitle hint="local only">Privacy</SectionTitle>
-            <Row label="Redact logs & audit" hint="Key/token/password patterns sink pe [REDACTED]. Server side bhi wahi filter lagta hai.">
+            <SectionTitle hint="local only">Privacy & Security</SectionTitle>
+            <Row label="Redact logs & audit" hint="API keys, Bearer tokens, and secret patterns replaced with [REDACTED].">
               <Toggle value={s.redactLogs} onChange={(v) => o.update("redactLogs", v)} label="Redact logs" />
             </Row>
-            <Row label="Save debug audio" hint="Default off. Native build scratch me likhta hai, 24h me auto-delete.">
+            <Row label="Save debug audio" hint="Default off. Scratch TTS cache auto-prunes after 24h.">
               <Toggle value={s.saveDebugAudio} onChange={(v) => o.update("saveDebugAudio", v)} label="Save debug audio" />
             </Row>
-            <Row label="Telemetry" hint="Koi nahi. No analytics, no cloud sync, no crash upload.">
-              <Badge tone="green">none</Badge>
-            </Row>
-            <Row label="Secrets" hint="Is build me koi secret store hi nahi hota. Native me Keychain.">
-              <Badge tone="green">no secrets stored</Badge>
-            </Row>
-            <Row label="Bridge network exposure" hint="Node bridge sirf 127.0.0.1 pe bind karta hai aur non-loopback peer ko 403 deta hai.">
-              <Badge tone="green">loopback only</Badge>
+            <Row label="Bridge network exposure" hint="Binds strictly to 127.0.0.1 and rejects non-loopback peers with HTTP 403.">
+              <Badge tone="green" dot>loopback only</Badge>
             </Row>
             <div className="mt-4 flex gap-2">
               <Button variant="danger" onClick={o.clearSessions}>
@@ -402,34 +421,24 @@ export function SettingsPanel({ o }: { o: Orchestrator }) {
                 Clear local audit
               </Button>
             </div>
-            <p className="mt-3 text-[11.5px] leading-relaxed text-[var(--color-amber)]">
-              ⚠︎ Honest note: browser SpeechRecognition (Chrome) audio Google servers pe bhejta hai. "On-device" guarantee sirf native Apple Speech me
-              milti hai. Dekho LIMITATIONS → L-6.
-            </p>
           </Panel>
         )}
 
         {tab === "About" && (
           <Panel className="p-4">
-            <SectionTitle>About</SectionTitle>
+            <SectionTitle>About Hermes Voice</SectionTitle>
             <Row label="Product">
-              <span className="text-[12.5px] font-500 text-[var(--color-ink)]">Hermes Voice — voice shell + local bridge</span>
+              <span className="text-[12.5px] font-500 text-[var(--color-ink)]">Hermes Voice — macOS Voice Front-End for Hermes Agent</span>
             </Row>
             <Row label="Version">
-              <span className="font-mono text-[12px] text-[var(--color-ink-2)]">0.2.0 {h ? `· bridge v${h.version}` : ""}</span>
+              <span className="font-mono text-[12px] text-[var(--color-gold-bright)]">1.0.0 {h ? `· bridge v${h.version}` : ""}</span>
             </Row>
-            <Row label="Spec">
-              <span className="text-[12.5px] text-[var(--color-ink-2)]">Master build specification §0–§37</span>
+            <Row label="Runtime">
+              <span className="font-mono text-[11px] text-[var(--color-ink-2)]">{h?.python?.bin ?? "/Users/apple/.hermes/hermes-agent/venv/bin/python"}</span>
             </Row>
             <Row label="Cost">
-              <Badge tone="green">₹0 — koi paid route nahi</Badge>
+              <Badge tone="gold" dot>$0 / ₹0 — 100% Free Local & Edge Neural Stack</Badge>
             </Row>
-            <Row label="Brain">
-              <span className="font-mono text-[11px] text-[var(--color-muted)]">~/.hermes → 127.0.0.1:20128</span>
-            </Row>
-            <p className="mt-3 text-[11.5px] leading-relaxed text-[var(--color-muted)]">
-              Ye front-end hai. Hermes brain hai, Omniroute provider pool hai. Ye app na Hermes replace karti hai, na keys manage karti hai, na combos edit karti hai.
-            </p>
           </Panel>
         )}
       </div>

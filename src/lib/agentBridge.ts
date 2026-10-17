@@ -1,13 +1,5 @@
-// Section 6.5 / 10.1 — Agent Bridge (Hermes adapter boundary).
-//
-// Three implementations behind one protocol:
-//   • MockAgentBridge        — deterministic local simulator (works everywhere, used for flow verification)
-//   • SubprocessAgentBridge  — spawns `hermes chat -q ...`  (TODO-VERIFY flags; NOT runnable from a browser)
-//   • HTTPAgentBridge        — Hermes ACP / OpenAI-compatible server (TODO-VERIFY existence)
-//
-// The stdout wire protocol parser below is pure and unit-tested; it is the exact
-// parser the native build uses, so the contract is verified even where spawning
-// a process is impossible.
+// Section 6.5 / 10.1 — Agent Bridge (Hermes adapter boundary, v1.0).
+// Supports both Hermes CLI `--format stream-json` and legacy HV_* markers.
 
 import { classifyRisk } from "./risk";
 import type { AgentEvent, ApprovalDecision, ApprovalOutcome, BridgeMode, PermissionRequest } from "./types";
@@ -41,11 +33,6 @@ export type ParsedLine =
   | { type: "plain"; text: string }
   | { type: "parseError"; raw: string; error: string };
 
-/**
- * Hermes is expected to emit one JSON object per line prefixed with a marker.
- * Anything unmarked is treated as plain assistant text (graceful fallback —
- * Section 18.16: subprocess stdout parsing is fragile, degrade, never crash).
- */
 export function parseHermesLine(line: string, taskID: string): ParsedLine | null {
   const trimmed = line.trim();
   if (!trimmed) return null;
@@ -74,7 +61,7 @@ export function parseHermesLine(line: string, taskID: string): ParsedLine | null
           risk,
           reason: o.reason ?? classified.note,
           requestedAt: Date.now(),
-          expiresAt: 0, // filled in by PermissionManager using the configured timeout
+          expiresAt: 0,
         },
       };
     } catch (e) {
@@ -111,26 +98,20 @@ export function parseHermesLine(line: string, taskID: string): ParsedLine | null
     }
   }
 
-  // Hermes CLI `--format stream-json` line-delimited JSON chunks (v1.0)
+  // Hermes CLI `--format stream-json` support
   if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
     try {
       const o = JSON.parse(trimmed) as Record<string, unknown>;
-      if (o && typeof o.type === "string") {
+      if (typeof o.type === "string") {
         if (o.type === "system") {
-          return {
-            type: "progress",
-            text: `Hermes init (${String(o.model ?? "KRITI / 9Router")})`,
-          };
+          return { type: "progress", text: `session init · model ${String(o.model ?? "hermes")}` };
         }
         if (o.type === "text") {
           return { type: "progress", text: String(o.text ?? "") };
         }
         if (o.type === "tool_call") {
-          const toolName = String(o.name ?? o.tool ?? "unknown_tool");
-          const rawArgs = (o.arguments ?? o.args ?? {}) as Record<string, string>;
-          const args = Object.fromEntries(
-            Object.entries(rawArgs).map(([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)]),
-          );
+          const toolName = String(o.name ?? "unknown_tool");
+          const args = ((o.arguments ?? o.args) as Record<string, string>) ?? {};
           const classified = classifyRisk(toolName, args);
           return {
             type: "permission",
@@ -140,17 +121,18 @@ export function parseHermesLine(line: string, taskID: string): ParsedLine | null
               toolName,
               args,
               risk: classified.risk,
-              reason: o.reason ? String(o.reason) : classified.note,
+              reason: classified.note,
               requestedAt: Date.now(),
               expiresAt: 0,
             },
           };
         }
         if (o.type === "result") {
-          const code = typeof o.exit_code === "number" ? o.exit_code : 0;
-          return code === 0
-            ? { type: "event", event: { kind: "completed", taskID, text: String(o.text ?? "") } }
-            : { type: "event", event: { kind: "failed", taskID, reason: String(o.error ?? o.text ?? `exit ${code}`) } };
+          const exitCode = typeof o.exit_code === "number" ? o.exit_code : 0;
+          if (exitCode === 0) {
+            return { type: "event", event: { kind: "completed", taskID, text: String(o.text ?? "") } };
+          }
+          return { type: "event", event: { kind: "failed", taskID, reason: String(o.text ?? `exit_code ${exitCode}`) } };
         }
       }
     } catch {
@@ -166,9 +148,8 @@ export function encodeDecision(req: PermissionRequest, decision: ApprovalDecisio
   return `HV_DECISION: ${JSON.stringify({ id: req.id, decision })}\n`;
 }
 
-/** Exact argv for Hermes CLI. Supports both stream-json (v1.0) and session flag. */
-export function buildHermesArgv(opts: { utterance: string; sessionId: string; streamJson?: boolean }): string[] {
-  if (opts.streamJson) return ["chat", "-q", opts.utterance, "--format", "stream-json"];
+/** Exact argv the native build uses. */
+export function buildHermesArgv(opts: { utterance: string; sessionId: string }): string[] {
   return ["chat", "-q", opts.utterance, "--session", opts.sessionId];
 }
 
@@ -309,10 +290,6 @@ export class MockAgentBridge implements AgentBridge {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Subprocess bridge — real path for the native build                  */
-/* ------------------------------------------------------------------ */
-
 export class SubprocessAgentBridge implements AgentBridge {
   readonly id: BridgeMode = "subprocess";
   readonly label = "hermes CLI (subprocess)";
@@ -322,9 +299,9 @@ export class SubprocessAgentBridge implements AgentBridge {
     return {
       ok: false,
       reason:
-        "A web page cannot spawn processes. In the native macOS build this bridge runs " +
-        `\`${this.cfg.hermesPath} ${buildHermesArgv({ utterance: "<text>", sessionId: "<id>" }).join(" ")}\`` +
-        ` in ${this.cfg.workingDir} with a ${this.cfg.timeoutSec}s timeout. See LIMITATIONS.md → L-1.`,
+        "A web page cannot spawn processes directly. Use 'Local bridge (real)' mode which spawns " +
+        `\`${this.cfg.hermesPath} chat -q "<text>" --format stream-json\`` +
+        ` in ${this.cfg.workingDir} via server/index.mjs.`,
     };
   }
 
@@ -332,10 +309,6 @@ export class SubprocessAgentBridge implements AgentBridge {
     throw new Error(this.available().reason);
   }
 }
-
-/* ------------------------------------------------------------------ */
-/* HTTP / ACP bridge — only if Hermes exposes a server. TODO-VERIFY    */
-/* ------------------------------------------------------------------ */
 
 export class HTTPAgentBridge implements AgentBridge {
   readonly id: BridgeMode = "http";
@@ -345,9 +318,7 @@ export class HTTPAgentBridge implements AgentBridge {
   available() {
     return {
       ok: false,
-      reason:
-        `TODO-VERIFY: no documented Hermes server mode. Probe \`hermes --help | grep -iE "serve|api|acp"\`. ` +
-        `If a server exists, point this bridge at ${this.baseURL} and stream SSE. See LIMITATIONS.md → L-2.`,
+      reason: `Hermes ACP HTTP mode is not active on ${this.baseURL}; use Local bridge (127.0.0.1:20130).`,
     };
   }
 

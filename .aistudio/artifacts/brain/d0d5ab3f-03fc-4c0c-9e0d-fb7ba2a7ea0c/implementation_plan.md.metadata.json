@@ -1,0 +1,6 @@
+{
+  "summary": "Revised Hermes Voice v1.0 Production Build Plan: updated Decision 3 to use direct stdin HV_DECISION writes without SIGSTOP (preventing thread deadlocks since Hermes CLI natively blocks on stdin for approval) and added Carbon RegisterEventHotKey + graceful Accessibility permission handling for the ⌥ Space hotkey.",
+  "updatedAt": "2026-10-17T06:01:39.330354339Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

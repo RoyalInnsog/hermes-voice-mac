@@ -1,4 +1,5 @@
-// server/speechPrep.mjs — make agent output speakable & map spoken decisions (Spec §2.4).
+// server/speechPrep.mjs — make agent output speakable (spec §6.8 text preprocessing).
+// Mirrors src/lib/speech.ts so both sides produce the same spoken text.
 
 export function speechify(input) {
   let s = String(input ?? "");
@@ -26,20 +27,17 @@ export function summarizeForSpeech(input, maxChars = 320) {
   return `${out} Poori report overlay me hai.`;
 }
 
-// Denials checked first so phrases like "nahi kar do" / "nahi ruko" never falsely match allow.
-const DENY = /\b(nahi\s*ruko|nahi|na\b|no\b|nope|deny|denied|ruk\s*jao|ruko|ruk\b|cancel|mat\s*karo|mat\s*kar|mat\b|stop|reject)\b/i;
-const ALLOW = /\b(permission\s*di|haan\s*kar\s*do|kar\s*de|kar\s*do|theek\s*hai|theek|haan|haa|ha\b|yes\b|yep|allow|allowed|proceed|ok\b|okay|approve|approved)\b/i;
+const ALLOW = /\b(allow|yes|yep|haan|haa|ha|kar\s*do|kar\s*de|permission\s*di|proceed|theek\s*hai|theek|ok|okay|approve|allowed|chalo|chalega)\b/i;
+const DENY = /\b(deny|no|nope|nahi|na|mat\s*kar|mat|ruk\s*jao|ruko|ruk|cancel|reject|stop|abort)\b/i;
 
-/**
- * Voice decision mapping (Spec §2.4):
- *   Affirmations: ["haan", "ha", "yes", "allow", "proceed", "kar de", "kar do", "permission di", "theek hai"] -> "allow"
- *   Denials:      ["nahi", "no", "deny", "ruk", "ruko", "nahi ruko", "cancel", "mat kar"] -> "deny"
- *   Ambiguous input returns null — never guess.
- */
+/** Voice decision mapping. Ambiguous input returns null — never guess. */
 export function mapVoiceDecision(text) {
   const s = String(text ?? "").toLowerCase().trim();
   if (!s) return null;
-  if (DENY.test(s)) return "deny";
-  if (ALLOW.test(s)) return "allow";
+  const isAllow = ALLOW.test(s);
+  const isDeny = DENY.test(s);
+  if (isAllow && isDeny) return null; // ambiguous
+  if (isAllow) return "allow";
+  if (isDeny) return "deny";
   return null;
 }

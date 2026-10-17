@@ -1,5 +1,5 @@
-// Hermes Voice — core data models.
-// Mirrors Section 7 of the master spec (Swift structs -> TS types).
+// Hermes Voice — core data models (v1.0).
+// Mirrors Section 7 of the master spec.
 
 export type Role = "user" | "assistant" | "system";
 
@@ -128,7 +128,7 @@ export const DEFAULT_SETTINGS: Settings = {
   lang: "hinglish",
   sttLocale: "en-IN",
   onDeviceSTT: true,
-  ttsEngine: "webSpeech",
+  ttsEngine: "edgeTTS",
   ttsVoiceURI: null,
   ttsRate: 1,
   ttsPitch: 1,
@@ -138,7 +138,7 @@ export const DEFAULT_SETTINGS: Settings = {
   bridgeMode: "local",
   bridgeURL: "http://127.0.0.1:20130",
   useBridgeTTS: true,
-  hermesPath: "/opt/homebrew/bin/hermes",
+  hermesPath: "/Users/apple/.hermes/hermes-agent/.hermes/bin/hermes",
   hermesWorkingDir: "~/.hermes",
   hermesTimeoutSec: 300,
   httpBridgeBaseURL: "http://127.0.0.1:8080",

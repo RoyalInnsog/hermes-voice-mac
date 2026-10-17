@@ -1,8 +1,7 @@
-// src/lib/localBridge.ts — client for the real local bridge (server/index.mjs).
+// src/lib/localBridge.ts — client for the real local bridge (server/index.mjs, v1.0).
 //
-// This is the path that makes the product actually work: the Node bridge spawns
-// `hermes`, streams HV_* events over SSE, pauses on permission requests and takes
-// the decision back over HTTP. The browser never spawns anything itself.
+// Connects to http://127.0.0.1:20130 on macOS and automatically falls back to
+// same-origin `/api/*` when served directly by the self-contained server or preview proxy.
 
 import type { AgentBridge, SendContext } from "./agentBridge";
 import type { ApprovalOutcome, AuditEntry, ComboInfo, HealthStatus, LogLine, ModelInfo, PermissionRequest, Session } from "./types";
@@ -15,22 +14,14 @@ export interface BridgeServerHealth {
   uptimeSec: number;
   pid: number;
   dataDir: string;
-  staticBundleReady?: boolean;
-  python?: { bin: string; source: string; verifiedVenv: boolean; candidates?: string[] };
+  pythonPath?: string;
   hermes: { found: boolean; path?: string; detail: string; command: string[]; argvTemplate: string[]; cwd: string; timeoutSec: number };
-  omniroute: HealthStatus & {
-    baseURL: string;
-    probeModel: string;
-    activeCombo?: string;
-    path?: string | null;
-    status?: number | null;
-    sqlite?: { available: boolean; path: string; combosCount: number; providersCount: number };
-  };
+  omniroute: HealthStatus & { baseURL: string; probeModel: string; activeComboName?: string; path?: string | null; status?: number | null };
   tts: {
-    engines: Record<string, { available: boolean; detail: string; cost: string; pythonBin?: string; version?: string | null }>;
-    configured: { engine: string; voice: string; rate: string };
+    engines: Record<string, { available: boolean; detail: string; cost: string; pythonPath?: string }>;
+    configured: { engine: string; voice: string; rate: string; pythonPath?: string; cacheDir?: string };
   };
-  tasks: { live: number; total: number; cap: number; awaitingPermission: number; activeModel?: string };
+  tasks: { live: number; total: number; cap: number; awaitingPermission: number };
   permissions: { timeoutSec: number; autoApproveLowRisk: boolean };
   logging: { level: string; redact: boolean };
   protocol: Record<string, unknown>;
@@ -47,15 +38,41 @@ export interface ServerTestResult {
 const START_HINT = "Bridge nahi chal raha. Terminal me: node server/index.mjs  (default http://127.0.0.1:20130)";
 
 export class BridgeClient {
+  private useSameOriginFallback = false;
+
   constructor(public baseURL: string) {}
 
-  private url(path: string) {
+  public resolveMediaUrl(path: string): string {
+    if (this.useSameOriginFallback) return path;
+    return this.baseURL.replace(/\/+$/, "") + path;
+  }
+
+  private url(path: string, sameOrigin = false) {
+    if (sameOrigin || this.useSameOriginFallback) return path;
     return this.baseURL.replace(/\/+$/, "") + path;
   }
 
   private async req<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
     const { timeoutMs = 12000, ...rest } = init ?? {};
-    const res = await fetch(this.url(path), { ...rest, signal: AbortSignal.timeout(timeoutMs) });
+    let res: Response;
+    try {
+      res = await fetch(this.url(path), { ...rest, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (primaryErr) {
+      // If we are in a browser where 127.0.0.1:20130 is cross-origin or proxied on same origin, try same-origin /api/*
+      if (!this.useSameOriginFallback && typeof window !== "undefined" && window.location.origin !== this.baseURL) {
+        try {
+          res = await fetch(this.url(path, true), { ...rest, signal: AbortSignal.timeout(timeoutMs) });
+          if (res.ok || res.status >= 400) {
+            this.useSameOriginFallback = true;
+          }
+        } catch {
+          throw primaryErr;
+        }
+      } else {
+        throw primaryErr;
+      }
+    }
+
     const text = await res.text();
     let body: unknown = text;
     try {
@@ -99,7 +116,10 @@ export class BridgeClient {
     });
   }
 
-  async createTask(utterance: string, sessionId: string): Promise<{ task: { id: string; sessionId: string; status: string; argv: string[] }; eventsUrl: string }> {
+  async createTask(
+    utterance: string,
+    sessionId: string,
+  ): Promise<{ task: { id: string; sessionId: string; status: string; argv: string[] }; eventsUrl: string }> {
     return this.req("/api/tasks", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -141,7 +161,14 @@ export class BridgeClient {
     return this.req(`/api/memory/file?path=${encodeURIComponent(path)}`, { timeoutMs: 8000 });
   }
 
-  async tts(text: string, voice?: string, engine?: string): Promise<{ ok: true; url: string; engine: string; bytes: number; ms: number; spokenText: string } | { ok: false; error: string; message?: string; hint?: string }> {
+  async tts(
+    text: string,
+    voice?: string,
+    engine?: string,
+  ): Promise<
+    | { ok: true; url: string; engine: string; bytes: number; ms: number; spokenText: string; cached?: boolean }
+    | { ok: false; error: string; message?: string; hint?: string }
+  > {
     return this.req("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -155,11 +182,7 @@ export class BridgeClient {
   }
 
   /** Streams task events; resolves when the bridge reports the terminal state. */
-  async streamEvents(
-    taskId: string,
-    onEvent: (e: ServerEvent) => void,
-    signal: AbortSignal,
-  ): Promise<void> {
+  async streamEvents(taskId: string, onEvent: (e: ServerEvent) => void, signal: AbortSignal): Promise<void> {
     const res = await fetch(this.url(`/api/tasks/${taskId}/events`), { signal });
     if (!res.ok || !res.body) throw new Error(`SSE failed: HTTP ${res.status}`);
     const reader = res.body.getReader();
@@ -191,8 +214,7 @@ export class BridgeClient {
 
 export type ServerEvent =
   | { seq: number; at: number; taskId: string; type: "thinking"; payload: Record<string, never> }
-  | { seq: number; at: number; taskId: string; type: "status"; payload: { subtype: string; model: string; sessionId: string } }
-  | { seq: number; at: number; taskId: string; type: "progress"; payload: { text: string; raw?: boolean; parseError?: boolean; warning?: boolean } }
+  | { seq: number; at: number; taskId: string; type: "progress"; payload: { text: string; raw?: boolean; parseError?: boolean; warning?: boolean; stream?: boolean } }
   | { seq: number; at: number; taskId: string; type: "toolCall"; payload: { name: string; args: Record<string, string> } }
   | { seq: number; at: number; taskId: string; type: "permissionRequest"; payload: { request: PermissionRequest & { timeoutSec?: number } } }
   | { seq: number; at: number; taskId: string; type: "permissionDecision"; payload: { requestId: string; tool: string; decision: string; via: string; deliveredToAgent: boolean; risk?: string } }
@@ -202,12 +224,6 @@ export type ServerEvent =
   | { seq: number; at: number; taskId: string; type: "exit"; payload: { status: string; durationMs: number } }
   | { seq: number; at: number; taskId: string; type: "end" };
 
-/**
- * AgentBridge implementation backed by the local Node bridge.
- * Permission decisions round-trip to the server, which re-validates risk policy
- * (voice-blocked for high/critical, typed ALLOW for critical) before forwarding
- * to the child process' stdin.
- */
 export class LocalBridge implements AgentBridge {
   readonly id = "local" as const;
   readonly label = "Local bridge (server/index.mjs)";
@@ -237,13 +253,6 @@ export class LocalBridge implements AgentBridge {
           case "thinking":
             ctx.onEvent({ kind: "thinking", taskID: task.id });
             break;
-          case "status":
-            ctx.onEvent({
-              kind: "progress",
-              taskID: task.id,
-              text: `Model active: ${evt.payload.model} (session ${evt.payload.sessionId.slice(0, 8)})`,
-            });
-            break;
           case "progress":
             ctx.onEvent({ kind: "progress", taskID: task.id, text: evt.payload.text });
             break;
@@ -262,9 +271,14 @@ export class LocalBridge implements AgentBridge {
                 await this.client.decide(task.id, req.id, outcome);
               } catch (e) {
                 const err = e as Error & { hint?: string };
-                ctx.onEvent({ kind: "progress", taskID: task.id, text: `⚠︎ decision rejected by bridge: ${err.message}${err.hint ? ` (${err.hint})` : ""}` });
-                // If the server refused (e.g. critical without typed ALLOW), deny so the agent can move on.
-                if (outcome.decision !== "deny") await this.client.decide(task.id, req.id, { decision: "deny", via: "click" }).catch(() => {});
+                ctx.onEvent({
+                  kind: "progress",
+                  taskID: task.id,
+                  text: `⚠︎ decision rejected by bridge: ${err.message}${err.hint ? ` (${err.hint})` : ""}`,
+                });
+                if (outcome.decision !== "deny") {
+                  await this.client.decide(task.id, req.id, { decision: "deny", via: "click" }).catch(() => {});
+                }
               }
             });
             break;

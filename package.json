@@ -1,12 +1,17 @@
 {
-  "name": "react-vite-tailwind",
+  "name": "hermes-voice-mac",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "start": "node server/index.mjs",
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node server/selftest.mjs",
+    "verify": "node scripts/verify-v1.mjs",
+    "hud": "node scripts/launch-hud.mjs",
+    "macos:build": "bash scripts/build-macos-app.sh"
   },
   "dependencies": {
     "clsx": "2.1.1",

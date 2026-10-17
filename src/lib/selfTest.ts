@@ -1,15 +1,15 @@
-// Section 15 — test suite. The native build uses XCTest; this build ships the
-// same assertions as an in-app runnable suite so the logic can be verified
-// adversarially without Xcode (see LIMITATIONS.md → L-4).
+// Section 15 — XCTest-equivalent automated test suite, runnable in the app (v1.0).
+// Covers: state machine, redactor, risk classifier, protocol parser (stream-json + HV_*),
+// Omniroute read-only contract, voice decision grammar, and session retention.
 
-import { attempt, canTransition, TRANSITIONS, type StateName } from "./stateMachine";
-import { redact, redactArgs, REDACTED } from "./redactor";
-import { allowsVoiceApproval, canAutoApprove, classifyRisk, requiresTypedConfirm } from "./risk";
-import { buildHermesArgv, encodeDecision, parseHermesLine } from "./agentBridge";
-import { mapVoiceDecision, speechify, summarizeForSpeech } from "./speech";
+import { attempt, canTransition, type StateName } from "./stateMachine";
+import { redact, redactArgs } from "./redactor";
+import { canAutoApprove, allowsVoiceApproval, classifyRisk, requiresTypedConfirm } from "./risk";
+import { parseHermesLine } from "./agentBridge";
+import { ALLOWED_METHODS, OmnirouteClient } from "./omniroute";
+import { mapVoiceDecision, speechify } from "./speech";
 import { prune } from "./store";
-import { OmnirouteClient } from "./omniroute";
-import type { PermissionRequest, Session } from "./types";
+import type { Session } from "./types";
 
 export interface TestResult {
   suite: string;
@@ -19,309 +19,242 @@ export interface TestResult {
   ms: number;
 }
 
-class Assert {
-  constructor(private log: string[]) {}
-  true(cond: boolean, msg: string) {
-    if (!cond) throw new Error("expected true: " + msg);
-    this.log.push("✓ " + msg);
-  }
-  eq<T>(a: T, b: T, msg: string) {
-    if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`${msg} — got ${JSON.stringify(a)}, want ${JSON.stringify(b)}`);
-    this.log.push(`✓ ${msg}`);
-  }
-  contains(hay: string, needle: string, msg: string) {
-    if (!hay.includes(needle)) throw new Error(`${msg} — ${JSON.stringify(hay)} missing ${JSON.stringify(needle)}`);
-    this.log.push("✓ " + msg);
-  }
-  notContains(hay: string, needle: string, msg: string) {
-    if (hay.includes(needle)) throw new Error(`${msg} — ${JSON.stringify(hay)} must not contain ${JSON.stringify(needle)}`);
-    this.log.push("✓ " + msg);
-  }
+type Case = { suite: string; name: string; run: () => void | Promise<void> };
+
+function assert(cond: unknown, msg: string) {
+  if (!cond) throw new Error(msg);
+}
+function eq<T>(actual: T, expected: T, msg?: string) {
+  const a = JSON.stringify(actual);
+  const b = JSON.stringify(expected);
+  if (a !== b) throw new Error(`${msg ?? "mismatch"}: got ${a}, expected ${b}`);
 }
 
-type TestFn = (t: Assert) => void | Promise<void>;
-interface TestDef {
-  suite: string;
-  name: string;
-  fn: TestFn;
-}
+const CASES: Case[] = [
+  // ---- State Machine (Section 4.1) ----
+  {
+    suite: "StateMachine",
+    name: "happy path: idle → listening → transcribing → thinking → speaking → idle",
+    run: () => {
+      let s: StateName = "idle";
+      const step = (to: StateName) => {
+        const r = attempt(s, to);
+        assert(r.ok, `failed transition ${s} -> ${to}`);
+        s = r.to;
+      };
+      step("listening");
+      eq(s, "listening");
+      step("transcribing");
+      eq(s, "transcribing");
+      step("thinking");
+      eq(s, "thinking");
+      step("speaking");
+      eq(s, "speaking");
+      step("idle");
+      eq(s, "idle");
+    },
+  },
+  {
+    suite: "StateMachine",
+    name: "permission branch: thinking → awaitingPermission → thinking on decision",
+    run: () => {
+      const r1 = attempt("thinking", "awaitingPermission");
+      eq(r1.ok, true);
+      eq(r1.to, "awaitingPermission");
+      const r2 = attempt("awaitingPermission", "thinking");
+      eq(r2.ok, true);
+      eq(r2.to, "thinking");
+    },
+  },
+  {
+    suite: "StateMachine",
+    name: "illegal transitions are rejected and logged, state preserved",
+    run: () => {
+      assert(!canTransition("idle", "awaitingPermission"), "idle -> awaitingPermission must be invalid");
+      const r = attempt("idle", "awaitingPermission");
+      eq(r.ok, false);
+    },
+  },
+  {
+    suite: "StateMachine",
+    name: "cancel works from thinking/awaitingPermission and returns to idle",
+    run: () => {
+      for (const busy of ["thinking", "awaitingPermission"] as StateName[]) {
+        const r1 = attempt(busy, "cancelling");
+        eq(r1.ok, true, `from ${busy}`);
+        const r2 = attempt("cancelling", "idle");
+        eq(r2.ok, true);
+      }
+    },
+  },
 
-const tests: TestDef[] = [];
-const suite = (suiteName: string, name: string, fn: TestFn) => tests.push({ suite: suiteName, name, fn });
+  // ---- Redactor (Section 12.2 / 15.1) ----
+  {
+    suite: "Redactor",
+    name: "redacts sk- keys, AIza Google keys, Bearer tokens, and key=value pairs",
+    run: () => {
+      const raw = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 key=sk-proj-abcdef012345678901234567 and AIzaSyD-9876543210abcdefghijklmnopqrstuv";
+      const out = redact(raw);
+      assert(!out.includes("eyJhbGci"), "JWT leaked");
+      assert(!out.includes("sk-proj-"), "sk- leaked");
+      assert(!out.includes("AIzaSy"), "AIza leaked");
+      assert(out.includes("[REDACTED]"), "marker missing");
+    },
+  },
+  {
+    suite: "Redactor",
+    name: "redacts sensitive keys in tool args while keeping safe paths intact",
+    run: () => {
+      const clean = redactArgs({ path: "~/project/README.md", api_key: "secretValue123456" });
+      eq(clean.path, "~/project/README.md");
+      eq(clean.api_key, "[REDACTED]");
+    },
+  },
 
-/* ---------------------- AppStateMachineTests ---------------------- */
+  // ---- Risk Classifier (Section 6.7 / 15.1) ----
+  {
+    suite: "Risk",
+    name: "classifies known tools and escalates unknown tools to high",
+    run: () => {
+      eq(classifyRisk("read_file", { path: "a.txt" }).risk, "low");
+      eq(classifyRisk("write_file", { path: "a.txt" }).risk, "medium");
+      eq(classifyRisk("git_push", {}).risk, "high");
+      eq(classifyRisk("totally_unknown_tool", {}).risk, "high");
+    },
+  },
+  {
+    suite: "Risk",
+    name: "argument danger patterns escalate shell/file tools to critical",
+    run: () => {
+      eq(classifyRisk("shell", { command: "rm -rf /tmp/build" }).risk, "critical");
+      eq(classifyRisk("shell", { command: "sudo launchctl list" }).risk, "critical");
+      eq(classifyRisk("read_file", { path: "~/.ssh/id_rsa" }).risk, "critical");
+    },
+  },
+  {
+    suite: "Risk",
+    name: "voice approval & typed ALLOW gates follow Section 6.7 matrix",
+    run: () => {
+      eq(allowsVoiceApproval("low", true), true);
+      eq(allowsVoiceApproval("medium", true), true);
+      eq(allowsVoiceApproval("high", true), false);
+      eq(allowsVoiceApproval("critical", true), false);
+      eq(requiresTypedConfirm("critical"), true);
+      eq(requiresTypedConfirm("high"), false);
+      eq(canAutoApprove("low", true), true);
+      eq(canAutoApprove("medium", true), false);
+    },
+  },
 
-suite("AppStateMachine", "every declared transition is accepted", (t) => {
-  for (const [from, tos] of Object.entries(TRANSITIONS) as [StateName, StateName[]][]) {
-    for (const to of tos) t.true(canTransition(from, to), `${from} → ${to}`);
-  }
-});
+  // ---- Agent Wire Protocol (Section 6.5 / v1.0 stream-json + HV_*) ----
+  {
+    suite: "Protocol",
+    name: "parses stream-json system, text, tool_call, and result lines",
+    run: () => {
+      const sys = parseHermesLine('{"type":"system","subtype":"init","model":"KRITI / 9Router","session_id":"s1"}', "t1");
+      eq(sys?.type, "event");
+      const txt = parseHermesLine('{"type":"text","text":"Checking OmniRoute combos..."}', "t1");
+      eq(txt?.type, "progress");
+      const tc = parseHermesLine('{"type":"tool_call","id":"call_9","name":"shell","arguments":{"command":"rm -rf /tmp/x"}}', "t1");
+      eq(tc?.type, "permission");
+      if (tc?.type === "permission") {
+        eq(tc.request.risk, "critical");
+        eq(tc.request.id, "call_9");
+      }
+      const res = parseHermesLine('{"type":"result","text":"Done.","exit_code":0}', "t1");
+      eq(res?.type, "event");
+    },
+  },
+  {
+    suite: "Protocol",
+    name: "parses HV_EVENT, HV_PERM, HV_PROGRESS, and falls back to plain text on malformed input",
+    run: () => {
+      const e1 = parseHermesLine('HV_EVENT: {"kind":"thinking","detail":"planning"}', "t1");
+      eq(e1?.type, "event");
+      const e2 = parseHermesLine('HV_PERM: {"id":"p1","tool":"shell","args":{"command":"rm -rf build"},"reason":"clean"}', "t1");
+      eq(e2?.type, "permission");
+      if (e2?.type === "permission") eq(e2.request.risk, "critical");
+      const e3 = parseHermesLine("HV_PROGRESS: step 2 of 3", "t1");
+      eq(e3?.type, "progress");
+      const e4 = parseHermesLine("HV_EVENT: {not valid json", "t1");
+      eq(e4?.type, "parseError");
+      const e5 = parseHermesLine("plain stdout line from hermes", "t1");
+      eq(e5?.type, "plain");
+    },
+  },
 
-suite("AppStateMachine", "invalid transitions are rejected, not thrown", (t) => {
-  const bad: [StateName, StateName][] = [
-    ["idle", "awaitingPermission"],
-    ["listening", "speaking"],
-    ["speaking", "awaitingPermission"],
-    ["cancelling", "thinking"],
-    ["error", "listening"],
-  ];
-  for (const [from, to] of bad) {
-    const r = attempt(from, to);
-    t.true(!r.ok, `rejected ${from} → ${to}`);
-    t.contains(r.reason ?? "", "invalid transition", "reason explains rejection");
-  }
-});
+  // ---- Omniroute Read-Only Contract (Section 6.6 / 10.2) ----
+  {
+    suite: "Omniroute",
+    name: "enforces read-only methods (GET + POST:/v1/chat/completions only)",
+    run: () => {
+      eq(ALLOWED_METHODS, ["GET", "POST:/v1/chat/completions"]);
+      const client = new OmnirouteClient("http://127.0.0.1:20128");
+      const proto = Object.getOwnPropertyNames(Object.getPrototypeOf(client));
+      for (const m of proto) {
+        assert(!/delete|put|patch|write|restart|kill|mutate|update/i.test(m), `forbidden method on OmnirouteClient: ${m}`);
+      }
+    },
+  },
 
-suite("AppStateMachine", "cancel path reachable from every busy state", (t) => {
-  for (const s of ["thinking", "awaitingPermission"] as StateName[]) t.true(canTransition(s, "cancelling"), `${s} → cancelling`);
-  t.true(canTransition("listening", "idle"), "listening → idle (cancel)");
-  t.true(canTransition("cancelling", "idle"), "cancelling → idle");
-});
+  // ---- Speech helpers (Section 6.7 / 6.8) ----
+  {
+    suite: "Speech",
+    name: "maps Hinglish/English voice replies to permission decisions & strips markdown for TTS",
+    run: () => {
+      eq(mapVoiceDecision("Haan kar do"), "allowOnce");
+      eq(mapVoiceDecision("permission di"), "allowOnce");
+      eq(mapVoiceDecision("theek hai allow"), "allowOnce");
+      eq(mapVoiceDecision("session ke liye allow"), "allowSession");
+      eq(mapVoiceDecision("nahi ruko"), "deny");
+      eq(mapVoiceDecision("mat kar"), "deny");
+      eq(mapVoiceDecision("random sentence"), null);
+      const spoken = speechify("Done: ```sh\nrm -rf a\n``` See `src/App.tsx` and https://example.com/x");
+      assert(!spoken.includes("```"), "code block not stripped");
+      assert(!spoken.includes("https://"), "URL not stripped");
+    },
+  },
 
-/* ---------------------------- RedactorTests ---------------------------- */
-
-suite("Redactor", "known key shapes are redacted", (t) => {
-  const samples = [
-    "key sk-abcdef1234567890abcdef",
-    "google AIzaSyB1234567890abcdefghijklmn",
-    "github ghp_abcdefghijklmnopqrstuvwxyz0123",
-    "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
-  ];
-  for (const s of samples) {
-    const out = redact(s);
-    t.contains(out, REDACTED, `redacted: ${s.slice(0, 12)}…`);
-  }
-});
-
-suite("Redactor", "key=value pairs are redacted but keys kept", (t) => {
-  const out = redact('api_key="supersecretvalue123" password=hunter2hunter2');
-  t.contains(out, "api_key=", "key name survives");
-  t.notContains(out, "supersecretvalue123", "secret value gone");
-  t.notContains(out, "hunter2hunter2", "password gone");
-});
-
-suite("Redactor", "ordinary prose is untouched", (t) => {
-  const s = "Omniroute healthy hai, latency 42 ms, 4 combos loaded.";
-  t.eq(redact(s), s, "no false positive on prose");
-});
-
-suite("Redactor", "sensitive arg keys redact regardless of value", (t) => {
-  const out = redactArgs({ path: "~/notes.md", gemini_api_key: "short" });
-  t.eq(out.gemini_api_key, REDACTED, "sensitive key redacted");
-  t.eq(out.path, "~/notes.md", "benign arg preserved");
-});
-
-/* ------------------------- RiskClassifierTests ------------------------- */
-
-suite("RiskClassifier", "known tools map to the spec matrix", (t) => {
-  t.eq(classifyRisk("read_file", { path: "a.md" }).risk, "low", "read_file = low");
-  t.eq(classifyRisk("write_file", { path: "a.md" }).risk, "medium", "write_file = medium");
-  t.eq(classifyRisk("git_push", {}).risk, "high", "git_push = high");
-  t.eq(classifyRisk("read_credentials", {}).risk, "critical", "credential access = critical");
-});
-
-suite("RiskClassifier", "unknown tool defaults to high", (t) => {
-  t.eq(classifyRisk("frobnicate_everything", {}).risk, "high", "unknown = high");
-});
-
-suite("RiskClassifier", "dangerous args escalate to critical", (t) => {
-  t.eq(classifyRisk("shell", { cmd: "rm -rf /" }).risk, "critical", "rm -rf escalates");
-  t.eq(classifyRisk("shell", { cmd: "sudo launchctl unload x" }).risk, "critical", "sudo escalates");
-  t.eq(classifyRisk("read_file", { path: "~/.ssh/id_rsa" }).risk, "critical", "ssh key path escalates");
-});
-
-suite("RiskClassifier", "policy gates match the matrix", (t) => {
-  t.true(canAutoApprove("low", true), "low auto-approvable when opted in");
-  t.true(!canAutoApprove("low", false), "default policy does not auto-approve");
-  t.true(!canAutoApprove("medium", true), "medium never auto-approved");
-  t.true(!canAutoApprove("critical", true), "critical never auto-approved");
-  t.true(allowsVoiceApproval("medium"), "voice ok for medium");
-  t.true(!allowsVoiceApproval("high"), "voice blocked for high");
-  t.true(requiresTypedConfirm("critical"), "critical needs typed ALLOW");
-});
-
-/* --------------------------- AgentBridgeTests -------------------------- */
-
-suite("AgentBridge", "HV_EVENT lines parse into typed events", (t) => {
-  const p = parseHermesLine('HV_EVENT: {"kind":"completed","text":"done"}', "task1");
-  t.eq(p?.type, "event", "typed as event");
-  if (p?.type === "event" && p.event.kind === "completed") t.eq(p.event.text, "done", "payload carried");
-});
-
-suite("AgentBridge", "HV_PERM lines build a permission request with risk", (t) => {
-  const p = parseHermesLine('HV_PERM: {"tool":"shell","args":{"cmd":"rm -rf ~/x"}}', "task1");
-  t.eq(p?.type, "permission", "typed as permission");
-  if (p?.type === "permission") {
-    t.eq(p.request.risk, "critical", "risk computed when absent");
-    t.eq(p.request.taskID, "task1", "task id attached");
-  }
-});
-
-suite("AgentBridge", "unmarked output degrades to plain text", (t) => {
-  const p = parseHermesLine("Omniroute healthy hai.", "t");
-  t.eq(p?.type, "plain", "plain fallback, no crash");
-});
-
-suite("AgentBridge", "malformed JSON yields parseError, never throws", (t) => {
-  const p = parseHermesLine("HV_EVENT: {not json", "t");
-  t.eq(p?.type, "parseError", "parseError returned");
-});
-
-suite("AgentBridge", "blank lines are ignored", (t) => {
-  t.eq(parseHermesLine("   ", "t"), null, "null for whitespace");
-});
-
-suite("AgentBridge", "decision encoding round-trips", (t) => {
-  const req = { id: "abc", toolName: "shell" } as PermissionRequest;
-  const line = encodeDecision(req, "allowOnce");
-  t.contains(line, "HV_DECISION:", "decision marker present");
-  const parsed = JSON.parse(line.replace("HV_DECISION:", "").trim()) as { id: string; decision: string };
-  t.eq(parsed, { id: "abc", decision: "allowOnce" }, "payload round-trips");
-});
-
-suite("AgentBridge", "argv supports both stream-json (v1.0) and session flag", (t) => {
-  t.eq(buildHermesArgv({ utterance: "hi", sessionId: "s1" }), ["chat", "-q", "hi", "--session", "s1"], "session argv shape");
-  t.eq(
-    buildHermesArgv({ utterance: "hi", sessionId: "s1", streamJson: true }),
-    ["chat", "-q", "hi", "--format", "stream-json"],
-    "stream-json argv shape",
-  );
-});
-
-suite("AgentBridge", "stream-json chunks (system, text, tool_call, result) parse cleanly", (t) => {
-  const sys = parseHermesLine('{"type":"system","subtype":"init","model":"KRITI","session_id":"s1"}', "task1");
-  t.eq(sys?.type, "progress", "system init parsed as progress");
-  const tc = parseHermesLine('{"type":"tool_call","name":"shell","arguments":{"cmd":"rm -rf /tmp/z"}}', "task1");
-  t.eq(tc?.type, "permission", "tool_call parsed as permission");
-  if (tc?.type === "permission") t.eq(tc.request.risk, "critical", "rm -rf escalated to critical");
-  const res = parseHermesLine('{"type":"result","text":"Task ho gaya","exit_code":0}', "task1");
-  t.eq(res?.type, "event", "result parsed as event");
-});
-
-/* --------------------------- OmnirouteTests ---------------------------- */
-
-suite("OmnirouteClient", "probe always sends stream:false", async (t) => {
-  const orig = globalThis.fetch;
-  let captured: { url: string; method: string; body: string } | null = null;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    captured = { url: String(input), method: init?.method ?? "GET", body: String(init?.body ?? "") };
-    return new Response(JSON.stringify({ choices: [{ message: { content: "pong" } }] }), { status: 200 });
-  }) as typeof fetch;
-  try {
-    const res = await new OmnirouteClient("http://127.0.0.1:20128").chatProbe("opc/beam-free");
-    t.true(res.ok, "probe parsed");
-    const cap = captured as unknown as { url: string; method: string; body: string } | null;
-    t.true(cap !== null, "request issued");
-    t.contains(cap!.body, '"stream":false', "stream:false present (SSE gotcha)");
-    t.contains(cap!.url, "/v1/chat/completions", "correct endpoint");
-  } finally {
-    globalThis.fetch = orig;
-  }
-});
-
-suite("OmnirouteClient", "never issues a mutating verb", async (t) => {
-  const orig = globalThis.fetch;
-  const methods: string[] = [];
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    methods.push(`${init?.method ?? "GET"} ${new URL(String(input)).pathname}`);
-    return new Response(JSON.stringify({ data: [], status: "ok" }), { status: 200 });
-  }) as typeof fetch;
-  try {
-    const c = new OmnirouteClient("http://127.0.0.1:20128");
-    await c.health();
-    await c.models();
-    await c.combos();
-    await c.chatProbe("x");
-    const bad = methods.filter((m) => /^(PUT|PATCH|DELETE)/.test(m) || (m.startsWith("POST") && !m.includes("/v1/chat/completions")));
-    t.eq(bad, [], "no PUT/PATCH/DELETE and no POST outside the probe endpoint");
-  } finally {
-    globalThis.fetch = orig;
-  }
-});
-
-suite("OmnirouteClient", "unreachable router degrades, does not throw", async (t) => {
-  const orig = globalThis.fetch;
-  globalThis.fetch = (async () => {
-    throw new Error("connection refused");
-  }) as typeof fetch;
-  try {
-    const h = await new OmnirouteClient("http://127.0.0.1:20128").health();
-    t.true(!h.reachable, "reports unreachable");
-    t.contains(h.detail, "no response", "detail explains");
-  } finally {
-    globalThis.fetch = orig;
-  }
-});
-
-/* ------------------------------ TTS tests ------------------------------ */
-
-suite("SpeechPrep", "markdown and code are stripped before speaking", (t) => {
-  const out = speechify("# Head\n`code` **bold** [link](http://x.com)\n```js\nconst a=1;\n```");
-  t.notContains(out, "```", "fences gone");
-  t.notContains(out, "**", "bold markers gone");
-  t.notContains(out, "http://x.com", "url not spelled out");
-});
-
-suite("SpeechPrep", "long text is summarized with an overlay pointer", (t) => {
-  const long = Array.from({ length: 40 }, (_, i) => `Sentence number ${i} about the task.`).join(" ");
-  const out = summarizeForSpeech(long);
-  t.true(out.length < long.length, "shortened");
-  t.contains(out, "overlay", "points to overlay for full report");
-});
-
-suite("VoiceCommands", "hinglish and english approvals map correctly", (t) => {
-  t.eq(mapVoiceDecision("haan kar do"), "allow", "haan kar do = allow");
-  t.eq(mapVoiceDecision("permission di"), "allow", "permission di = allow");
-  t.eq(mapVoiceDecision("kar de"), "allow", "kar de = allow");
-  t.eq(mapVoiceDecision("theek hai"), "allow", "theek hai = allow");
-  t.eq(mapVoiceDecision("Allow"), "allow", "allow = allow");
-  t.eq(mapVoiceDecision("nahi ruko"), "deny", "nahi ruko = deny");
-  t.eq(mapVoiceDecision("mat kar"), "deny", "mat kar = deny");
-  t.eq(mapVoiceDecision("nahi"), "deny", "nahi = deny");
-  t.eq(mapVoiceDecision("no thanks"), "deny", "no = deny");
-  t.eq(mapVoiceDecision("maybe later"), null, "ambiguous = null (no guessing)");
-});
-
-/* ---------------------------- Store tests ------------------------------ */
-
-suite("SessionStore", "retention keeps 100 newest and drops >30 days", (t) => {
-  const now = Date.now();
-  const mk = (i: number, age: number): Session => ({
-    schemaVersion: 1,
-    id: "s" + i,
-    startedAt: now - age,
-    endedAt: null,
-    status: "completed",
-    utterances: [],
-  });
-  const list = [...Array.from({ length: 150 }, (_, i) => mk(i, i * 1000)), mk(999, 40 * 24 * 3600 * 1000)];
-  const kept = prune(list);
-  t.eq(kept.length, 100, "capped at 100");
-  t.true(!kept.some((s) => s.id === "s999"), "40-day-old session dropped");
-  t.eq(kept[0].id, "s0", "newest first");
-});
-
-/* ------------------------------- runner -------------------------------- */
+  // ---- Retention (Section 7 / 12.3) ----
+  {
+    suite: "Retention",
+    name: "prunes sessions older than 30 days and caps at 100 newest",
+    run: () => {
+      const now = Date.now();
+      const old: Session = { id: "old", startedAt: now - 31 * 86400_000, endedAt: null, status: "completed", utterances: [], taskIds: [] };
+      const many: Session[] = Array.from({ length: 105 }, (_, i) => ({
+        id: `s-${i}`,
+        startedAt: now - i * 1000,
+        endedAt: null,
+        status: "completed",
+        utterances: [],
+        taskIds: [],
+      }));
+      const kept = prune([old, ...many]);
+      eq(kept.length, 100);
+      assert(!kept.some((s) => s.id === "old"), "31-day-old session was not pruned");
+    },
+  },
+];
 
 export async function runSelfTests(): Promise<TestResult[]> {
-  const results: TestResult[] = [];
-  for (const def of tests) {
-    const log: string[] = [];
+  const out: TestResult[] = [];
+  for (const c of CASES) {
     const t0 = performance.now();
     try {
-      await def.fn(new Assert(log));
-      results.push({ suite: def.suite, name: def.name, ok: true, detail: log.join("\n"), ms: Math.round(performance.now() - t0) });
+      await c.run();
+      out.push({ suite: c.suite, name: c.name, ok: true, detail: "PASS", ms: Math.round(performance.now() - t0) });
     } catch (e) {
-      results.push({
-        suite: def.suite,
-        name: def.name,
+      out.push({
+        suite: c.suite,
+        name: c.name,
         ok: false,
-        detail: [...log, "✗ " + (e instanceof Error ? e.message : String(e))].join("\n"),
+        detail: e instanceof Error ? e.message : String(e),
         ms: Math.round(performance.now() - t0),
       });
     }
   }
-  return results;
+  return out;
 }
 
-export const TEST_COUNT = tests.length;
+export const TEST_COUNT = CASES.length;

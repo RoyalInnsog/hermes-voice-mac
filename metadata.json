@@ -1,0 +1,7 @@
+{
+  "name": "Hermes Voice — macOS Voice Front-End for Hermes Agent",
+  "description": "Hotkey → Hinglish speech → Hermes does the work → spoken report. With stream-json tool-permission interception, Edge TTS neural synthesis, read-only OmniRoute sync, and a native macOS floating HUD.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

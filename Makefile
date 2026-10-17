@@ -1,36 +1,32 @@
-# Makefile — Hermes Voice v1.0 Production Build & Verification Targets (Spec §3.6).
+# Makefile — Hermes Voice v1.0 Production Build & macOS Bundler
 
-.PHONY: all start dev build test verify macos-app probe clean
+.PHONY: all install build start dev test verify macos-app hud clean
 
-all: build test
+all: build test macos-app
 
-## Build production single-file UI bundle (dist/index.html)
+install:
+	npm install
+
 build:
 	npm run build
 
-## Start self-contained production server (serves dist/ + /api/* on 127.0.0.1:20130)
-start: build
+start:
 	node server/index.mjs
 
-## Start Vite dev server
 dev:
 	npm run dev
 
-## Run backend unit + subprocess integration tests (30 cases)
 test:
 	node server/selftest.mjs
 
-## Run end-to-end v1.0 verification suite (scripts/verify-v1.mjs)
-verify: build
+verify:
 	node scripts/verify-v1.mjs
 
-## Run live HTTP/SSE bridge probe
-probe:
-	node scripts/probe-bridge.mjs
-
-## Build native macOS Floating HUD app bundle (dist/Hermes Voice.app)
 macos-app:
 	bash scripts/build-macos-app.sh
+
+hud:
+	node scripts/launch-hud.mjs
 
 clean:
 	rm -rf dist

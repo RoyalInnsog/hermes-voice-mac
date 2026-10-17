@@ -1,18 +1,14 @@
-// server/agent.mjs — Hermes Voice v1.0 TaskManager & Subprocess Bridge (Spec §2.1).
+// server/agent.mjs — the real Agent Bridge (spec §6.5, v1.0).
 //
-// Supports BOTH:
-//   1. Hermes CLI `--format stream-json` line-delimited JSON chunks
-//      ({"type":"system"|"text"|"tool_call"|"result"})
-//   2. Legacy HV_* markers (HV_EVENT:, HV_PERM:, HV_PROGRESS:) and raw stdout fallback.
-//
-// Hard rules enforced:
-//   • Max 10 concurrent agent tasks (HTTP 429 on 11th)
-//   • Process-group termination (SIGTERM -> 5s -> SIGKILL) on cancel or timeout
-//   • Critical risk requires typed ALLOW; high/critical block voice approval
-//   • All logged & audited payloads pass through redaction
+// Spawns the Hermes CLI (`hermes chat -q "<utterance>" --format stream-json`),
+// parses both stream-json and HV_* wire protocols, streams AgentEvents over SSE,
+// holds permission requests while Hermes CLI waits on stdin, writes HV_DECISION
+// directly to child stdin (no SIGSTOP to prevent thread/pipe deadlocks), and
+// enforces process-group termination (SIGTERM -> 5s -> SIGKILL) on cancel/timeout.
 
 import { spawn, execFile } from "node:child_process";
 import { existsSync } from "node:fs";
+import { DEFAULT_HERMES_PATHS } from "./config.mjs";
 import { buildArgv, encodeDecision, lineSplitter, parseLine } from "./protocol.mjs";
 import { canAutoApprove, classifyRisk } from "./risk.mjs";
 import { redact } from "./redact.mjs";
@@ -32,12 +28,13 @@ export class TaskManager {
     this.config = config;
     this.log = log;
     this.tasks = new Map();
-    this.subscribers = new Map();
-    this.activeModel = config.omniroute?.activeComboHint || "KRITI / 9Router";
+    this.subscribers = new Map(); // taskId -> Set<fn>
+    this._binary = null;
   }
 
   /* ------------------------------ discovery ----------------------------- */
 
+  /** Probe the binary instead of assuming it exists (spec §18.14/§18.15). */
   async resolveBinary() {
     const cmd = this.config.hermes.command?.[0];
     if (!cmd) return { found: false, detail: "no command configured" };
@@ -46,20 +43,19 @@ export class TaskManager {
         ? { found: true, path: cmd, detail: "configured absolute path exists" }
         : { found: false, path: cmd, detail: "configured path does not exist" };
     }
-    const found = await new Promise((res) =>
-      execFile("sh", ["-c", `command -v ${cmd}`], (err, out) => res(err ? "" : out.trim())),
-    );
-    if (found) return { found: true, path: found, detail: "resolved on PATH" };
-    const hints = this.config.hermes.pathHint ?? [];
+
+    // 1. Check configured pathHints first (includes /Users/apple/.hermes/hermes-agent/.hermes/bin and ~/.local/bin)
+    const hints = this.config.hermes.pathHint ?? DEFAULT_HERMES_PATHS;
     for (const dir of hints) {
       const p = `${dir}/${cmd}`;
       if (existsSync(p)) return { found: true, path: p, detail: `found in ${dir}` };
     }
-    return {
-      found: false,
-      path: cmd,
-      detail: `not on PATH; searched ${hints.join(", ") || "no extra dirs"}`,
-    };
+
+    // 2. Check system PATH
+    const found = await new Promise((res) => execFile("sh", ["-c", `command -v "${cmd}"`], (err, out) => res(err ? "" : out.trim())));
+    if (found) return { found: true, path: found, detail: "resolved on PATH" };
+
+    return { found: false, path: cmd, detail: `not on PATH; searched ${hints.join(", ") || "no extra dirs"}` };
   }
 
   /* -------------------------------- start -------------------------------- */
@@ -68,13 +64,9 @@ export class TaskManager {
     const text = String(utterance ?? "").trim();
     if (!text) throw new TaskError(400, "emptyUtterance", "utterance is empty");
     if (text.length > 4000) throw new TaskError(413, "utteranceTooLong", "utterance longer than 4000 chars");
-    if (this.tasks.size >= this.config.maxConcurrentTasks) {
-      throw new TaskError(
-        429,
-        "tooManyTasks",
-        `hard cap of ${this.config.maxConcurrentTasks} concurrent tasks reached`,
-        "Cancel a running task first",
-      );
+    const activeCount = [...this.tasks.values()].filter((t) => !["done", "failed", "cancelled"].includes(t.status)).length;
+    if (activeCount >= this.config.maxConcurrentTasks) {
+      throw new TaskError(429, "tooManyTasks", `hard cap of ${this.config.maxConcurrentTasks} concurrent tasks reached`, "Cancel a running task first");
     }
 
     const bin = await this.resolveBinary();
@@ -83,7 +75,7 @@ export class TaskManager {
         503,
         "hermesNotFound",
         `agent binary not found: ${bin.path}`,
-        `${bin.detail}. Expected at /Users/apple/.hermes/hermes-agent/.hermes/bin/hermes or set HV_HERMES_CMD`,
+        `${bin.detail}. Set hermes.command in ~/.hermes-voice/config.json or HV_HERMES_CMD`,
       );
     }
 
@@ -96,14 +88,13 @@ export class TaskManager {
       sessionId: sid,
       utterance: text,
       meta: meta ?? null,
-      model: this.activeModel,
+      model: null,
       status: "running",
       events: [],
       seq: 0,
       startedAt: Date.now(),
       finishedAt: null,
       plain: [],
-      streamedText: [],
       stderr: "",
       pending: new Map(),
       allowlist: new Set(),
@@ -112,7 +103,7 @@ export class TaskManager {
       cwd: this.config.hermes.cwd,
     };
     this.tasks.set(id, task);
-    this.log.info("agent", `spawn ${task.argv.slice(0, 4).join(" ")}… (task ${id.slice(0, 8)})`);
+    this.log.info("agent", `spawn ${bin.path} ${argv.slice(0, 4).join(" ")}… (task ${id.slice(0, 8)})`);
 
     this.#emit(task, "thinking", {});
 
@@ -122,13 +113,14 @@ export class TaskManager {
 
     try {
       task.child = spawn(task.argv[0], task.argv.slice(1), {
-        cwd: existsSync(task.cwd) ? task.cwd : undefined,
+        cwd: task.cwd && existsSync(task.cwd) ? task.cwd : undefined,
         env,
         detached: process.platform !== "win32",
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (e) {
       this.#fail(task, "hermesCrashed", `spawn failed: ${e.message}`);
+      this.#finish(task);
       return this.#public(task);
     }
 
@@ -146,10 +138,11 @@ export class TaskManager {
     task.child.on("close", (code, signal) => {
       for (const line of splitter.flush()) this.#handleLine(task, line);
       if (task.status === "cancelled") return this.#finish(task);
+      // Graceful fallback (§10.1): no structured completed event → whole stdout is the answer.
       if (!task.events.some((e) => e.type === "completed" || e.type === "failed")) {
-        const textOut = (task.streamedText.join("") || task.plain.join("\n")).trim();
+        const textOut = task.plain.join("\n").trim();
         if (code === 0 && textOut) {
-          this.#emit(task, "completed", { text: textOut, degraded: task.streamedText.length ? undefined : "raw-stdout" });
+          this.#emit(task, "completed", { text: textOut, degraded: "used accumulated stdout" });
         } else {
           this.#fail(
             task,
@@ -161,6 +154,7 @@ export class TaskManager {
       this.#finish(task);
     });
 
+    // Per-task timeout → process-group SIGTERM -> 5s -> SIGKILL and report.
     task.timeout = setTimeout(() => {
       this.log.warn("agent", `task ${id.slice(0, 8)} exceeded ${this.config.hermes.timeoutSec}s — killing process group`);
       this.#kill(task);
@@ -186,45 +180,30 @@ export class TaskManager {
         this.#emit(task, "progress", { text: parsed.text });
         break;
       case "streamSystem":
-        if (parsed.model) {
-          task.model = parsed.model;
-          this.activeModel = parsed.model;
-        }
-        this.#emit(task, "status", {
-          subtype: parsed.subtype,
-          model: parsed.model ?? task.model,
-          sessionId: parsed.sessionId ?? task.sessionId,
-        });
+        if (parsed.model) task.model = parsed.model;
         this.#emit(task, "progress", {
-          text: `Hermes initialized (${parsed.model ?? task.model})`,
-          system: true,
+          text: `Hermes stream-json initialized${parsed.model ? ` · model ${parsed.model}` : ""}`,
+          subtype: parsed.subtype,
         });
         break;
       case "streamText":
         if (parsed.text) {
-          task.streamedText.push(parsed.text);
-          this.#emit(task, "progress", { text: parsed.text, streamChunk: true });
+          task.plain.push(parsed.text);
+          this.#emit(task, "progress", { text: parsed.text, stream: true });
         }
         break;
-      case "streamToolCall": {
-        const req = parsed.request;
-        // Intercept as permission request if risk >= medium, or if low and autoApproveLowRisk is false
-        if (parsed.requiresGate && (req.risk !== "low" || !this.config.permissions.autoApproveLowRisk)) {
-          this.#handlePermission(task, req, true);
-        } else {
-          this.#emit(task, "toolCall", { name: req.toolName, args: req.args });
-        }
+      case "streamToolCall":
+        // In stream-json mode, intercept tool_call for permission gating if risk >= medium (or if low & autoApproveLowRisk is false)
+        this.#handlePermission(task, parsed.request, { emitToolOnAllow: true });
         break;
-      }
-      case "streamResult": {
-        const finalText = (parsed.text || task.streamedText.join("") || task.plain.join("\n")).trim();
+      case "streamResult":
         if (parsed.exitCode === 0) {
-          this.#emit(task, "completed", { text: finalText || "Task completed." });
+          const finalText = parsed.text || task.plain.join("\n").trim() || "Task completed.";
+          this.#emit(task, "completed", { text: finalText });
         } else {
-          this.#fail(task, "agentReported", parsed.error || finalText || `exit_code ${parsed.exitCode}`);
+          this.#fail(task, "agentReported", parsed.text || `Hermes exited with code ${parsed.exitCode}`);
         }
         break;
-      }
       case "event":
         if (parsed.event.kind === "toolCall") this.#emit(task, "toolCall", { name: parsed.event.name, args: parsed.event.args });
         else if (parsed.event.kind === "completed") this.#emit(task, "completed", { text: parsed.event.text });
@@ -233,23 +212,24 @@ export class TaskManager {
         else this.#emit(task, parsed.event.kind, {});
         break;
       case "permission":
-        this.#handlePermission(task, parsed.request, false);
+        this.#handlePermission(task, parsed.request, { emitToolOnAllow: false });
         break;
       case "parseError":
-        this.log.warn("agent", `unparseable line: ${redact(parsed.raw).slice(0, 160)} (${parsed.error})`);
+        this.log.warn("agent", `unparseable HV line: ${redact(parsed.raw).slice(0, 160)} (${parsed.error})`);
         this.#emit(task, "progress", { text: `⚠︎ unparseable agent line (${parsed.error})`, parseError: true });
         break;
     }
   }
 
-  #handlePermission(task, req, emitToolCallOnApprove = false) {
+  #handlePermission(task, req, { emitToolOnAllow = false } = {}) {
     const timeoutSec = this.config.permissions.timeoutSec;
     const request = { ...req, requestedAt: Date.now(), expiresAt: Date.now() + timeoutSec * 1000, timeoutSec };
 
+    // Policy gates run server-side too — the UI cannot be trusted to enforce them.
     if (task.allowlist.has(req.toolName) && req.risk !== "critical") {
       this.#emit(task, "permissionDecision", { requestId: req.id, tool: req.toolName, decision: "allowSession", via: "policy-allowlist" });
       this.#writeDecision(task, req.id, "allowSession");
-      if (emitToolCallOnApprove) this.#emit(task, "toolCall", { name: req.toolName, args: req.args });
+      if (emitToolOnAllow) this.#emit(task, "toolCall", { name: req.toolName, args: req.args });
       appendAudit(
         { taskId: task.id, tool: req.toolName, risk: req.risk, decision: "allowSession", via: "policy", args: req.args, reason: req.reason },
         { redactEnabled: this.config.logging.redact },
@@ -259,7 +239,7 @@ export class TaskManager {
     if (canAutoApprove(req.risk, this.config.permissions.autoApproveLowRisk)) {
       this.#emit(task, "permissionDecision", { requestId: req.id, tool: req.toolName, decision: "allowOnce", via: "policy-auto-low" });
       this.#writeDecision(task, req.id, "allowOnce");
-      if (emitToolCallOnApprove) this.#emit(task, "toolCall", { name: req.toolName, args: req.args });
+      if (emitToolOnAllow) this.#emit(task, "toolCall", { name: req.toolName, args: req.args });
       appendAudit(
         { taskId: task.id, tool: req.toolName, risk: req.risk, decision: "allowOnce", via: "policy", args: req.args, reason: req.reason },
         { redactEnabled: this.config.logging.redact },
@@ -274,19 +254,31 @@ export class TaskManager {
     const timer = setTimeout(() => {
       if (!task.pending.has(req.id)) return;
       this.log.warn("permissions", `timeout ${req.toolName} → auto-deny`);
-      this.#resolve(task, req, "deny", "timeout", emitToolCallOnApprove);
+      this.#resolve(task, req, "deny", "timeout");
     }, timeoutSec * 1000);
 
-    task.pending.set(req.id, { request, timer, emitToolCallOnApprove });
+    task.pending.set(req.id, { request, timer, emitToolOnAllow });
   }
 
+  /**
+   * Direct stdin write without SIGSTOP (prevents pipe/thread deadlocks since Hermes CLI
+   * blocks natively on stdin while awaiting approval).
+   */
   #writeDecision(task, permId, decision) {
     if (!task.child?.stdin?.writable) {
-      this.log.warn("agent", "child stdin closed — decision cannot be delivered");
+      this.log.warn("agent", "child stdin closed — decision cannot be delivered (LIMITATIONS L-2)");
       this.#emit(task, "progress", { text: "⚠︎ agent stdin already closed; decision not deliverable", warning: true });
       return false;
     }
     try {
+      // Ensure child is not stopped before writing to stdin
+      if (task.child.pid && process.platform !== "win32") {
+        try {
+          process.kill(-task.child.pid, "SIGCONT");
+        } catch {
+          /* ignore if not stopped or not group leader */
+        }
+      }
       task.child.stdin.write(encodeDecision(permId, decision));
       return true;
     } catch (e) {
@@ -295,30 +287,28 @@ export class TaskManager {
     }
   }
 
+  /** Decision from the UI (click / voice / typed confirmation). */
   decide({ taskId, requestId, decision, via = "click", typedConfirm = null }) {
     const task = this.tasks.get(taskId);
     if (!task) throw new TaskError(404, "taskNotFound", `no such task: ${taskId}`);
     const pending = task.pending.get(requestId);
     if (!pending) throw new TaskError(409, "requestNotPending", `permission ${requestId} is not awaiting a decision`);
-    if (!["allowOnce", "allowSession", "deny"].includes(decision)) {
-      throw new TaskError(400, "badDecision", "decision must be allowOnce|allowSession|deny");
-    }
+    if (!["allowOnce", "allowSession", "deny"].includes(decision)) throw new TaskError(400, "badDecision", `decision must be allowOnce|allowSession|deny`);
 
+    // Server-side security invariants — never trust the client.
     if (decision !== "deny" && ["high", "critical"].includes(pending.request.risk) && via === "voice") {
       throw new TaskError(403, "voiceBlocked", `${pending.request.risk} risk cannot be approved by voice`);
     }
     if (pending.request.risk === "critical") {
-      if (decision === "allowSession") {
-        throw new TaskError(403, "noSessionAllowlist", "critical tools can never be session-allowlisted");
-      }
+      if (decision === "allowSession") throw new TaskError(403, "noSessionAllowlist", "critical tools can never be session-allowlisted");
       if (decision !== "deny" && typedConfirm !== "ALLOW") {
         throw new TaskError(403, "typedConfirmRequired", "critical risk requires typed confirmation ALLOW");
       }
     }
-    return this.#resolve(task, pending.request, decision, via, pending.emitToolCallOnApprove);
+    return this.#resolve(task, pending.request, decision, via);
   }
 
-  #resolve(task, request, decision, via, emitToolCallOnApprove = false) {
+  #resolve(task, request, decision, via) {
     const entry = task.pending.get(request.id);
     if (!entry) return null;
     clearTimeout(entry.timer);
@@ -327,9 +317,6 @@ export class TaskManager {
     task.status = task.pending.size ? "awaiting" : "running";
 
     const delivered = this.#writeDecision(task, request.id, decision);
-    if (emitToolCallOnApprove && decision !== "deny") {
-      this.#emit(task, "toolCall", { name: request.toolName, args: request.args });
-    }
     const auditRow = appendAudit(
       {
         taskId: task.id,
@@ -351,6 +338,9 @@ export class TaskManager {
       deliveredToAgent: delivered,
       auditId: auditRow.id,
     });
+    if (entry.emitToolOnAllow && (decision === "allowOnce" || decision === "allowSession")) {
+      this.#emit(task, "toolCall", { name: request.toolName, args: request.args });
+    }
     this.log.info("permissions", `${request.toolName} [${request.risk}] → ${decision} via ${via} (delivered=${delivered})`);
     return { decision, via, deliveredToAgent: delivered };
   }
@@ -370,31 +360,41 @@ export class TaskManager {
   }
 
   /**
-   * Process-group termination (Spec §1.6):
-   * Sends SIGTERM to the process group (-pid), waits 5s, then sends SIGKILL.
+   * Process-group termination: SIGTERM -> 5s -> SIGKILL (spec §1.6).
    */
   #kill(task) {
     const c = task.child;
     if (!c || c.killed) return;
-    const sendSig = (sig) => {
-      try {
-        if (c.pid && process.platform !== "win32") {
-          process.kill(-c.pid, sig);
-          return;
+    const pid = c.pid;
+    try {
+      if (pid && process.platform !== "win32") {
+        try {
+          process.kill(-pid, "SIGTERM");
+        } catch {
+          c.kill("SIGTERM");
         }
-      } catch {
-        /* fallback to direct child kill */
+      } else {
+        c.kill("SIGTERM");
       }
-      try {
-        c.kill(sig);
-      } catch {
-        /* already exited */
-      }
-    };
-    sendSig("SIGTERM");
-    setTimeout(() => {
-      if (!c.killed) sendSig("SIGKILL");
-    }, 5000);
+      const killTimer = setTimeout(() => {
+        try {
+          if (pid && process.platform !== "win32") {
+            try {
+              process.kill(-pid, "SIGKILL");
+            } catch {
+              if (!c.killed) c.kill("SIGKILL");
+            }
+          } else if (!c.killed) {
+            c.kill("SIGKILL");
+          }
+        } catch {
+          /* already gone */
+        }
+      }, 5000);
+      killTimer.unref?.();
+    } catch (e) {
+      this.log.error("agent", `kill failed: ${e.message}`);
+    }
   }
 
   /* ------------------------------- lifecycle ----------------------------- */
@@ -404,16 +404,16 @@ export class TaskManager {
     this.log.error("agent", `${code}: ${redact(message)}`);
   }
 
+  /** Drop every outstanding permission timer so a finished task can never act later. */
   #clearPending(task) {
     for (const [, entry] of task.pending) clearTimeout(entry.timer);
-    if (task.pending.size) {
-      this.log.warn("permissions", `task ${task.id.slice(0, 8)} ended with ${task.pending.size} unanswered request(s) — dropped`);
-    }
+    if (task.pending.size) this.log.warn("permissions", `task ${task.id.slice(0, 8)} ended with ${task.pending.size} unanswered request(s) — dropped`);
     task.pending.clear();
     if (task.status === "awaiting") task.status = "running";
   }
 
   #finish(task) {
+    if (task.finishedAt) return;
     clearTimeout(task.timeout);
     this.#clearPending(task);
     task.finishedAt = Date.now();
@@ -421,11 +421,12 @@ export class TaskManager {
       task.status = task.events.some((e) => e.type === "failed") ? "failed" : "done";
     }
     this.#emit(task, "exit", { status: task.status, durationMs: task.finishedAt - task.startedAt });
-    this.#recordUtterance(task, null);
+    this.#recordUtterance(task, null); // flush session
     this.log.info("agent", `task ${task.id.slice(0, 8)} ${task.status} in ${task.finishedAt - task.startedAt}ms`);
-    setTimeout(() => {
+    const cleanupTimer = setTimeout(() => {
       if (["done", "failed", "cancelled"].includes(task.status)) this.tasks.delete(task.id);
     }, 10 * 60 * 1000);
+    cleanupTimer.unref?.();
   }
 
   #recordUtterance(task, utterance) {
@@ -448,14 +449,7 @@ export class TaskManager {
       const final = task.events.find((e) => e.type === "completed");
       const failed = task.events.find((e) => e.type === "failed");
       if (final) {
-        session.utterances.push({
-          id: crypto.randomUUID(),
-          timestamp: Date.now(),
-          role: "assistant",
-          text: final.payload.text,
-          audioDuration: null,
-          confidence: null,
-        });
+        session.utterances.push({ id: crypto.randomUUID(), timestamp: Date.now(), role: "assistant", text: final.payload.text, audioDuration: null, confidence: null });
       } else if (failed) {
         session.utterances.push({
           id: crypto.randomUUID(),
@@ -540,10 +534,10 @@ export class TaskManager {
       total: this.tasks.size,
       cap: this.config.maxConcurrentTasks,
       awaitingPermission: [...this.tasks.values()].filter((t) => t.status === "awaiting").length,
-      activeModel: this.activeModel,
     };
   }
 
+  /** Kill every live child and clear every timer on shutdown — nothing orphaned. */
   shutdown() {
     for (const task of this.tasks.values()) {
       this.#clearPending(task);

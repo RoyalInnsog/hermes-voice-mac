@@ -51,8 +51,8 @@ export function canAutoApprove(risk: RiskLevel, autoApproveLowRisk: boolean): bo
   return autoApproveLowRisk && risk === "low";
 }
 
-export function allowsVoiceApproval(risk: RiskLevel): boolean {
-  return risk === "low" || risk === "medium";
+export function allowsVoiceApproval(risk: RiskLevel, enabled = true): boolean {
+  return enabled && (risk === "low" || risk === "medium");
 }
 
 export function requiresTypedConfirm(risk: RiskLevel): boolean {
