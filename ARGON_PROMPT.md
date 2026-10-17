@@ -1,8 +1,9 @@
 # MISSION SPECIFICATION FOR GEMINI 4 ARGON: Hermes Voice v1.0 Production Build
 
 > **Target Model:** Gemini 4 Argon (Google DeepMind Frontier Model)  
-> **Source Base Archive:** `/Users/apple/Downloads/hermes-voice-macos-specification.zip`  
-> **Context:** The user is attaching the archive `hermes-voice-macos-specification.zip` to this turn.  
+> **GitHub Repository:** https://github.com/RoyalInnsog/hermes-voice-mac  
+> **Source Base Archive:** `/Users/apple/Downloads/hermes-voice-macos-specification.zip` (also pushed to GitHub above)  
+> **Context:** The full repository is live and public at https://github.com/RoyalInnsog/hermes-voice-mac. You can inspect all files directly from the repository.  
 > **Objective:** Upgrade this repository into a rock-solid, production-ready, daily-driver macOS Voice Assistant frontend for Hermes Agent connected to OmniRoute. Zero mockups, zero stubs, zero placeholders.
 
 ---
