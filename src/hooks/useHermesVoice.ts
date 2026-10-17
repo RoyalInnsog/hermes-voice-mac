@@ -8,7 +8,7 @@ import { allowsVoiceApproval, canAutoApprove } from "../lib/risk";
 import { makeBridge, type AgentBridge } from "../lib/agentBridge";
 import { BridgeClient, LocalBridge, type BridgeServerHealth, type ServerTestResult } from "../lib/localBridge";
 import { OmnirouteClient, type ProbeResult } from "../lib/omniroute";
-import { mapVoiceDecision, speechify, summarizeForSpeech, WebSTTEngine, WebTTSEngine } from "../lib/speech";
+import { duckSystemAudio, mapVoiceDecision, restoreSystemAudio, speechify, summarizeForSpeech, WebSTTEngine, WebTTSEngine } from "../lib/speech";
 import { appendAudit, clearAudit, deleteSessions, loadAudit, loadSessions, loadSettings, saveSession, saveSettings } from "../lib/store";
 import { errText, type ErrorCode } from "../lib/errors";
 import { confirmTranscriptPrompt, permissionAskPrompt, t } from "../lib/strings";
@@ -157,6 +157,7 @@ export function useHermesVoice() {
     }
     tts.current?.stop();
     setSpeakingNow(false);
+    restoreSystemAudio(settingsRef.current.bridgeURL);
   }, []);
 
   /** Speak via the bridge's Edge TTS when available; otherwise the system voice. */
@@ -176,6 +177,7 @@ export function useHermesVoice() {
         audioEl.current = el;
         el.src = url;
         el.volume = s.ttsVolume;
+        duckSystemAudio(s.bridgeURL);
         setSpeakingNow(true);
 
         // Animate playback waveform energy while audio plays
@@ -203,12 +205,14 @@ export function useHermesVoice() {
         cancelAnimationFrame(playbackMeterRaf.current);
         setPlaybackLevel(0);
         setSpeakingNow(false);
+        restoreSystemAudio(s.bridgeURL);
         logger.info("tts", `played ${res.bytes}B from bridge engine=${res.engine}${res.cached ? " (cached)" : ""} in ${res.ms}ms`);
         return true;
       } catch (e) {
         cancelAnimationFrame(playbackMeterRaf.current);
         setPlaybackLevel(0);
         setSpeakingNow(false);
+        restoreSystemAudio(s.bridgeURL);
         logger.warn("tts", `bridge audio playback failed: ${e instanceof Error ? e.message : String(e)}`);
         return false;
       }
@@ -227,6 +231,7 @@ export function useHermesVoice() {
         if (s.ttsEngine !== "webSpeech") logger.warn("tts", `engine "${s.ttsEngine}" unavailable → falling back to system voice`);
       }
       if (!tts.current) return;
+      duckSystemAudio(s.bridgeURL);
       setSpeakingNow(true);
       setPlaybackLevel(0.35);
       await tts.current.speak(speechify(text), {
@@ -239,6 +244,7 @@ export function useHermesVoice() {
       });
       setPlaybackLevel(0);
       setSpeakingNow(false);
+      restoreSystemAudio(s.bridgeURL);
     },
     [playBridgeAudio],
   );
@@ -399,10 +405,15 @@ export function useHermesVoice() {
           push({ kind: "tool", text: e.name, meta: formatArgs(redactArgs(e.args)) });
           logger.info("agent", `toolCall ${e.name} ${formatArgs(redactArgs(e.args))}`);
           break;
-        case "progress":
+        case "progress": {
           push({ kind: "progress", text: e.text });
-          if (s.speakProgress && e.text.length < 120) void speak(e.text, "low");
+          const isMidTaskPing = e.text.startsWith("🔊 ");
+          const spokenText = isMidTaskPing ? e.text.replace(/^🔊\s*/, "") : e.text;
+          if ((isMidTaskPing || s.speakProgress) && spokenText.length < 140) {
+            void speak(spokenText, "low");
+          }
           break;
+        }
         case "completed": {
           setLastAssistant(e.text);
           push({ kind: "assistant", text: e.text });
@@ -496,11 +507,12 @@ export function useHermesVoice() {
 
   /* ------------------------------- listening ----------------------------- */
 
-  const finalizeTranscript = useCallback(
+    const finalizeTranscript = useCallback(
     (text: string, confidence: number, durationMs: number) => {
       const s = settingsRef.current;
       setPartial("");
       setLevel(0);
+      restoreSystemAudio(s.bridgeURL);
       if (!text.trim()) {
         setState("idle", "empty transcript");
         return;
@@ -550,6 +562,7 @@ export function useHermesVoice() {
     setPartial("");
     listenStart.current = Date.now();
     bargeIn();
+    duckSystemAudio(s.bridgeURL);
 
     if (maxLenTimer.current) window.clearTimeout(maxLenTimer.current);
     maxLenTimer.current = window.setTimeout(() => {
@@ -636,7 +649,7 @@ export function useHermesVoice() {
       }
       const d = mapVoiceDecision(spoken);
       if (!d) return false;
-      resolvePermission(d === "allow" ? "allowOnce" : "deny", "voice");
+      resolvePermission(d, "voice");
       return true;
     },
     [pending, push, resolvePermission],

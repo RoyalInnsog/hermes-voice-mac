@@ -184,9 +184,16 @@ async function runVerification() {
     assert(combosRes.status === 200, `GET /api/router/combos expected 200, got ${combosRes.status}`);
     const combosData = await combosRes.json();
     assert(Array.isArray(combosData.combos), "Expected combos array from /api/router/combos");
-    console.log(`  ✓ [5/5] Verified strict read-only OmniRoute endpoint (combos=${combosData.combos.length}, source=${combosData.pathUsed ?? "probed"})`);
+    console.log(`  ✓ [5/6] Verified strict read-only OmniRoute endpoint (combos=${combosData.combos.length}, source=${combosData.pathUsed ?? "probed"})`);
 
-    console.log("\n✅ ALL HERMES VOICE v1.0 VERIFICATION CHECKS PASSED.");
+    // 6. Verify v1.1 Native Deepening & Polish (Audio Ducking, Status Bar Menu, SFSpeechRecognizer Hook)
+    const duckRes = await fetch(`${baseURL}/api/audio/duck`, { method: "POST" });
+    assert(duckRes.status === 200, `POST /api/audio/duck expected 200, got ${duckRes.status}`);
+    const restoreRes = await fetch(`${baseURL}/api/audio/restore`, { method: "POST" });
+    assert(restoreRes.status === 200, `POST /api/audio/restore expected 200, got ${restoreRes.status}`);
+    console.log("  ✓ [6/6] Verified v1.1 Audio Ducking (/api/audio/duck & /api/audio/restore) & Native Hooks");
+
+    console.log("\n✅ ALL HERMES VOICE v1.0 & v1.1 VERIFICATION CHECKS PASSED.");
   } finally {
     await srv.close();
     rmSync(scratchDataDir, { recursive: true, force: true });

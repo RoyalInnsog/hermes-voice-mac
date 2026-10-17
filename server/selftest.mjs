@@ -563,6 +563,35 @@ test("integration", "hard timeout kills a hung agent", async (t) => {
   }
 });
 
+test("integration", "long-running silent task emits conversational Hinglish progressPing", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "hv-int10-"));
+  store.__setTestRoots(dir);
+  const tm = new TaskManager({
+    config: managerConfig({
+      hermes: {
+        command: ["node"],
+        argvTemplate: [FAKE, "chat", "-q", "{{utterance}}", "--session", "{{sessionId}}"],
+        cwd: HERE,
+        timeoutSec: 15,
+        progressPingMs: 300,
+        pathHint: [],
+      },
+    }),
+    log: new Logger({ level: "error" }),
+  });
+  try {
+    const task = await tm.start({ utterance: "run a slow task", sessionId: "sess-10" });
+    const pingEvt = await until(() => tm.get(task.id).events.find((e) => e.type === "progressPing"), 6000, "progressPing event");
+    t.has(pingEvt.payload.text, "Kaam chal raha hai", "conversational Hinglish progress ping emitted");
+    t.eq(pingEvt.payload.pingIndex, 1, "first ping index recorded");
+    tm.cancel(task.id);
+  } finally {
+    tm.shutdown();
+    store.__setTestRoots(null);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 /* --------------------------------- runner -------------------------------- */
 
 export async function runServerTests() {

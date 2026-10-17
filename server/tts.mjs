@@ -1,15 +1,21 @@
-// server/tts.mjs — unlimited-free TTS first (Edge TTS), macOS `say` fallback (v1.0).
+// server/tts.mjs — unlimited-free TTS first (Edge TTS), macOS `say` fallback (v1.1).
 // Spec §6.8 / §24: Edge TTS is primary (free, uncapped) using the verified Python venv
 // at /Users/apple/.hermes/hermes-agent/venv/bin/python with SHA-256 disk caching in
-// ~/.hermes-voice/scratch/tts-cache/.
+// ~/.hermes-voice/scratch/tts-cache/ and mid-task Hinglish progress ping synthesis.
 
 import { spawn, execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { resolvePython, SCRATCH_DIR, TTS_CACHE_DIR } from "./config.mjs";
 import { redact } from "./redact.mjs";
 import { speechify, summarizeForSpeech } from "./speechPrep.mjs";
+
+export const PROGRESS_PING_PHRASES = [
+  "Kaam chal raha hai, check kar raha hoon...",
+  "Abhi process ho raha hai, bas thoda aur wait karo...",
+  "Hermes tools chala raha hai, main nazar rakh raha hoon...",
+];
 
 const CONCURRENCY = 2;
 let inFlight = 0;
@@ -79,6 +85,33 @@ function ensureCacheDirs() {
 
 function cacheKey(engine, voice, rate, text) {
   return createHash("sha256").update(`${engine}|${voice}|${rate}|${text}`).digest("hex").slice(0, 16);
+}
+
+/**
+ * Synthesize a conversational Hinglish mid-task progress ping (>12s silence during active task).
+ * Cached by SHA-256 in ~/.hermes-voice/scratch/tts-cache/ so repeated pings resolve in <1ms.
+ */
+export async function synthesizeProgressPing(
+  { index = 0, text, voice = "hi-IN-MadhurNeural", rate = "+0%", engine = "auto" } = {},
+  log,
+) {
+  const phrase = text || PROGRESS_PING_PHRASES[index % PROGRESS_PING_PHRASES.length];
+  try {
+    const res = await synthesize({ text: phrase, voice, rate, engine, maxChars: 240 }, log);
+    if (res.ok && res.file) {
+      return {
+        ok: true,
+        text: phrase,
+        engine: res.engine,
+        file: res.file,
+        audioUrl: `/api/media/${basename(res.file)}`,
+        cached: Boolean(res.cached),
+      };
+    }
+    return { ok: false, text: phrase, engine: res.engine ?? "none", audioUrl: null, error: res.error };
+  } catch (e) {
+    return { ok: false, text: phrase, engine: "none", audioUrl: null, error: e.message };
+  }
 }
 
 /**

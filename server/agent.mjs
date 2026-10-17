@@ -13,6 +13,7 @@ import { buildArgv, encodeDecision, lineSplitter, parseLine } from "./protocol.m
 import { canAutoApprove, classifyRisk } from "./risk.mjs";
 import { redact } from "./redact.mjs";
 import { appendAudit, saveSession, getSession } from "./store.mjs";
+import { synthesizeProgressPing } from "./tts.mjs";
 
 export class TaskError extends Error {
   constructor(status, code, message, hint) {
@@ -93,6 +94,9 @@ export class TaskManager {
       events: [],
       seq: 0,
       startedAt: Date.now(),
+      lastOutputAt: Date.now(),
+      pingCount: 0,
+      pingInterval: null,
       finishedAt: null,
       plain: [],
       stderr: "",
@@ -127,6 +131,7 @@ export class TaskManager {
     const splitter = lineSplitter();
     task.child.stdout.setEncoding("utf8");
     task.child.stdout.on("data", (chunk) => {
+      task.lastOutputAt = Date.now();
       for (const line of splitter.push(chunk)) this.#handleLine(task, line);
     });
     task.child.stderr.setEncoding("utf8");
@@ -153,6 +158,41 @@ export class TaskManager {
       }
       this.#finish(task);
     });
+
+    // Mid-task spoken progress ping (>12s without stdout output while task is actively running)
+    const progressPingMs = Number(this.config.hermes?.progressPingMs ?? 12000);
+    if (progressPingMs > 0) {
+      const checkEvery = Math.min(1000, Math.max(100, Math.floor(progressPingMs / 3)));
+      task.pingInterval = setInterval(async () => {
+        if (task.status !== "running" || task.finishedAt) return;
+        if (Date.now() - task.lastOutputAt < progressPingMs) return;
+        task.lastOutputAt = Date.now();
+        const pingIdx = task.pingCount++;
+        const ping = await synthesizeProgressPing(
+          {
+            index: pingIdx,
+            voice: this.config.tts?.voice ?? "hi-IN-MadhurNeural",
+            rate: this.config.tts?.rate ?? "+0%",
+            engine: this.config.tts?.engine ?? "auto",
+          },
+          this.log,
+        );
+        if (task.status !== "running" || task.finishedAt) return;
+        this.#emit(task, "progressPing", {
+          text: ping.text,
+          audioUrl: ping.audioUrl,
+          engine: ping.engine,
+          cached: Boolean(ping.cached),
+          pingIndex: pingIdx + 1,
+        });
+        this.#emit(task, "progress", {
+          text: ping.text,
+          audioUrl: ping.audioUrl,
+          isPing: true,
+        });
+      }, checkEvery);
+      task.pingInterval.unref?.();
+    }
 
     // Per-task timeout → process-group SIGTERM -> 5s -> SIGKILL and report.
     task.timeout = setTimeout(() => {
@@ -415,6 +455,7 @@ export class TaskManager {
   #finish(task) {
     if (task.finishedAt) return;
     clearTimeout(task.timeout);
+    if (task.pingInterval) clearInterval(task.pingInterval);
     this.#clearPending(task);
     task.finishedAt = Date.now();
     if (!["done", "failed", "cancelled"].includes(task.status)) {

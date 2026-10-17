@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# scripts/build-macos-app.sh — Compiles frontend, verifies backend, and packages `dist/Hermes Voice.app`
+# scripts/build-macos-app.sh — Compiles frontend, verifies backend, compiles native Swift STT & HUD,
+# and packages `dist/Hermes Voice.app` (Hermes Voice v1.1).
 # Uses ad-hoc code signing (`codesign --force --deep --sign -`) so no paid Apple Developer ID is required.
 
 set -euo pipefail
@@ -7,7 +8,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-echo "==> [1/4] Building Hermes Voice v1.0 frontend bundle (dist/)..."
+echo "==> [1/4] Building Hermes Voice v1.1 frontend bundle (dist/)..."
 npm run build
 
 echo "==> [2/4] Running backend self-test suite..."
@@ -18,10 +19,11 @@ APP_DIR="$ROOT_DIR/dist/$APP_NAME"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
+BIN_DIR="$ROOT_DIR/dist/bin"
 
 echo "==> [3/4] Packaging macOS bundle at: $APP_DIR"
 rm -rf "$APP_DIR"
-mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
+mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$BIN_DIR"
 
 cat > "$CONTENTS_DIR/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -37,9 +39,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<EOF
   <key>CFBundleDisplayName</key>
   <string>Hermes Voice</string>
   <key>CFBundleVersion</key>
-  <string>1.0.0</string>
+  <string>1.1.0</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0.0</string>
+  <string>1.1.0</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>LSMinimumSystemVersion</key>
@@ -50,8 +52,10 @@ cat > "$CONTENTS_DIR/Info.plist" <<EOF
   <true/>
   <key>NSMicrophoneUsageDescription</key>
   <string>Hermes Voice uses your microphone for Hinglish and English voice commands.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>Hermes Voice uses on-device Apple Speech recognition for offline Hinglish and English transcription.</string>
   <key>NSAppleEventsUsageDescription</key>
-  <string>Hermes Voice coordinates with local developer tools when approved.</string>
+  <string>Hermes Voice ducks system audio during voice interaction and coordinates with local developer tools.</string>
   <key>NSAppTransportSecurity</key>
   <dict>
     <key>NSAllowsLocalNetworking</key>
@@ -61,16 +65,24 @@ cat > "$CONTENTS_DIR/Info.plist" <<EOF
 </plist>
 EOF
 
-# Symlink or store repo path so the app bundle can auto-start server/index.mjs
+# Symlink repo path so the app bundle can auto-start and restart server/index.mjs
 ln -sf "$ROOT_DIR" "$RESOURCES_DIR/app"
 
 if command -v swiftc >/dev/null 2>&1 && [[ "$(uname -s)" == "Darwin" ]]; then
-  echo "==> Compiling native Swift WKWebView HUD (macos/HermesVoice.swift)..."
+  echo "==> Compiling native Swift SFSpeechRecognizer helper (app/stt.swift)..."
+  swiftc -O "$ROOT_DIR/app/stt.swift" \
+    -framework Speech \
+    -framework AVFoundation \
+    -o "$BIN_DIR/hv-stt"
+
+  echo "==> Compiling native Swift WKWebView HUD + Audio Ducker (macos/HermesVoice.swift)..."
   swiftc -O "$ROOT_DIR/macos/HermesVoice.swift" \
     -framework Cocoa \
     -framework WebKit \
     -framework Carbon \
     -framework ApplicationServices \
+    -framework Speech \
+    -framework AVFoundation \
     -o "$MACOS_DIR/HermesVoice"
 else
   echo "==> swiftc not detected on this host; installing portable macOS launcher stub..."
@@ -85,6 +97,9 @@ fi
 
 echo "==> [4/4] Applying ad-hoc signature..."
 if command -v codesign >/dev/null 2>&1 && [[ "$(uname -s)" == "Darwin" ]]; then
+  if [[ -f "$BIN_DIR/hv-stt" ]]; then
+    codesign --force --sign - "$BIN_DIR/hv-stt"
+  fi
   codesign --force --deep --sign - "$APP_DIR"
   echo "==> Signed with ad-hoc identity (-)."
 else

@@ -1,9 +1,69 @@
-// Section 6.4 / 6.8 — STT + TTS engines (v1.0).
+// Section 6.4 / 6.8 — STT + TTS engines + Native macOS Audio Ducking & SFSpeechRecognizer Hook (v1.1).
 // Features:
 //   • webkitSpeechRecognition with 'en-IN' primary and 'en-US' / 'hi-IN' auto-fallback
+//   • Offline Apple Speech (SFSpeechRecognizer) native hook fallback via WKWebView `hermesNative` or `/api/stt/stream`
+//   • Native macOS system audio ducking (`duckSystemAudio` / `restoreSystemAudio`)
 //   • Interim results for live typing animation
 //   • 1.8s silence / energy auto-stop detection after an utterance is spoken
 //   • Expanded Hinglish/English voice permission affirmation & denial mapping
+
+/* ----------------------- Native macOS Audio Ducking ---------------------- */
+
+type WebkitMessageHandler = {
+  postMessage: (msg: Record<string, unknown>) => void;
+};
+
+function getNativeBridge(): WebkitMessageHandler | null {
+  if (typeof window === "undefined") return null;
+  const w = window as unknown as {
+    webkit?: { messageHandlers?: { hermesNative?: WebkitMessageHandler } };
+  };
+  return w.webkit?.messageHandlers?.hermesNative ?? null;
+}
+
+export function isNativeMacWrapper(): boolean {
+  if (typeof window === "undefined") return false;
+  const w = window as unknown as { __HERMES_NATIVE__?: boolean };
+  return Boolean(w.__HERMES_NATIVE__ || getNativeBridge());
+}
+
+/**
+ * Ducks macOS system/media volume when user starts speaking or Hermes begins TTS playback.
+ */
+export function duckSystemAudio(bridgeBaseURL = "http://127.0.0.1:20130"): void {
+  const native = getNativeBridge();
+  if (native) {
+    try {
+      native.postMessage({ action: "duckAudio" });
+      return;
+    } catch {
+      /* fall through to HTTP bridge */
+    }
+  }
+  const base = bridgeBaseURL.replace(/\/+$/, "");
+  void fetch(`${base}/api/audio/duck`, { method: "POST" }).catch(() => {
+    void fetch("/api/audio/duck", { method: "POST" }).catch(() => {});
+  });
+}
+
+/**
+ * Immediately restores original macOS system volume upon completion, idle, or cancellation.
+ */
+export function restoreSystemAudio(bridgeBaseURL = "http://127.0.0.1:20130"): void {
+  const native = getNativeBridge();
+  if (native) {
+    try {
+      native.postMessage({ action: "restoreAudio" });
+      return;
+    } catch {
+      /* fall through to HTTP bridge */
+    }
+  }
+  const base = bridgeBaseURL.replace(/\/+$/, "");
+  void fetch(`${base}/api/audio/restore`, { method: "POST" }).catch(() => {
+    void fetch("/api/audio/restore", { method: "POST" }).catch(() => {});
+  });
+}
 
 /* ----------------------------- TTS text prep ----------------------------- */
 
@@ -132,6 +192,8 @@ const SILENCE_AUTO_STOP_MS = 1800; // 1.8s silence auto-stop per spec §2.4
 
 export class WebSTTEngine {
   private rec: AnySpeechRecognition | null = null;
+  private nativeEventSource: EventSource | null = null;
+  private nativeWindowListener: ((e: Event) => void) | null = null;
   private finalText = "";
   private interimText = "";
   private bestConfidence = 0;
@@ -143,7 +205,7 @@ export class WebSTTEngine {
   listening = false;
 
   static supported(): boolean {
-    return typeof window !== "undefined" && getRecognitionCtor() !== null;
+    return typeof window !== "undefined" && (getRecognitionCtor() !== null || isNativeMacWrapper());
   }
 
   private clearSilenceTimer() {
@@ -183,7 +245,6 @@ export class WebSTTEngine {
         }
         const rms = Math.sqrt(sum / buf.length);
         onLevel(rms);
-        // If user is actively speaking above background floor after speech has started, keep silence timer alive
         if (this.hasSpoken && rms > 0.045) {
           this.resetSilenceTimer();
         }
@@ -204,12 +265,100 @@ export class WebSTTEngine {
     this.audioCtx = null;
   }
 
-  async start(locale = "en-IN", cb: STTCallbacks) {
-    const Ctor = getRecognitionCtor();
-    if (!Ctor) {
-      cb.onError("unsupported", "SpeechRecognition API missing in this browser");
-      return;
+  /**
+   * Native Apple Speech (SFSpeechRecognizer) fallback hook:
+   * 1. Inside Hermes Voice.app WKWebView: uses `hermesNative` script handler + `hv:native-stt` event.
+   * 2. In browser connected to local bridge: connects to `/api/stt/stream` (`app/stt.swift`).
+   */
+  private startNativeAppleSpeechFallback(locale: string, cb: STTCallbacks): boolean {
+    const native = getNativeBridge();
+    if (native) {
+      this.listening = true;
+      const handler = (ev: Event) => {
+        const detail = (ev as CustomEvent<{ type: string; text?: string; confidence?: number; error?: string }>).detail;
+        if (!detail) return;
+        if (detail.type === "interim" && detail.text) {
+          this.interimText = detail.text;
+          this.hasSpoken = true;
+          cb.onPartial(detail.text);
+        } else if (detail.type === "final") {
+          this.cleanupNativeListeners();
+          this.listening = false;
+          this.stopMeter();
+          cb.onFinal((detail.text || this.interimText).trim(), detail.confidence ?? 0.92);
+        } else if (detail.type === "error") {
+          this.cleanupNativeListeners();
+          this.listening = false;
+          this.stopMeter();
+          cb.onError("other", detail.error || "SFSpeechRecognizer error");
+        }
+      };
+      this.nativeWindowListener = handler;
+      window.addEventListener("hv:native-stt", handler);
+      native.postMessage({ action: "startNativeSTT", locale });
+      return true;
     }
+
+    // Try SSE stream `/api/stt/stream` from local bridge (`app/stt.swift`)
+    if (typeof EventSource !== "undefined") {
+      try {
+        const es = new EventSource(`http://127.0.0.1:20130/api/stt/stream?locale=${encodeURIComponent(locale)}&silenceMs=${SILENCE_AUTO_STOP_MS}`);
+        this.nativeEventSource = es;
+        this.listening = true;
+        es.onmessage = (msg) => {
+          try {
+            const data = JSON.parse(msg.data) as { type: string; text?: string; confidence?: number; error?: string };
+            if (data.type === "interim" && data.text) {
+              this.interimText = data.text;
+              this.hasSpoken = true;
+              cb.onPartial(data.text);
+            } else if (data.type === "final") {
+              this.cleanupNativeListeners();
+              this.listening = false;
+              this.stopMeter();
+              cb.onFinal((data.text || this.interimText).trim(), data.confidence ?? 0.92);
+            } else if (data.type === "error") {
+              this.cleanupNativeListeners();
+              this.listening = false;
+              this.stopMeter();
+              cb.onError("other", data.error || "Native STT bridge error");
+            }
+          } catch {
+            /* ignore */
+          }
+        };
+        es.onerror = () => {
+          this.cleanupNativeListeners();
+          this.listening = false;
+          this.stopMeter();
+          const fallbackTxt = (this.finalText || this.interimText).trim();
+          if (fallbackTxt) {
+            cb.onFinal(fallbackTxt, 0.85);
+          } else {
+            cb.onError("other", "Speech recognition connection dropped");
+          }
+        };
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  private cleanupNativeListeners() {
+    if (this.nativeWindowListener) {
+      window.removeEventListener("hv:native-stt", this.nativeWindowListener);
+      this.nativeWindowListener = null;
+      getNativeBridge()?.postMessage({ action: "stopNativeSTT" });
+    }
+    if (this.nativeEventSource) {
+      this.nativeEventSource.close();
+      this.nativeEventSource = null;
+    }
+  }
+
+  async start(locale = "en-IN", cb: STTCallbacks) {
     if (this.listening) return;
     this.finalText = "";
     this.interimText = "";
@@ -217,6 +366,14 @@ export class WebSTTEngine {
     this.hasSpoken = false;
 
     if (cb.onLevel) await this.startMeter(cb.onLevel);
+
+    const Ctor = getRecognitionCtor();
+    if (!Ctor) {
+      if (this.startNativeAppleSpeechFallback(locale, cb)) return;
+      this.stopMeter();
+      cb.onError("unsupported", "SpeechRecognition API missing in this browser");
+      return;
+    }
 
     const localesToTry = [locale, ...FALLBACK_LOCALES.filter((l) => l !== locale)];
     let localeIndex = 0;
@@ -262,6 +419,16 @@ export class WebSTTEngine {
           launchWithLocale(localesToTry[localeIndex]);
           return;
         }
+        // If browser webkitSpeechRecognition drops network connection, seamlessly hand off to native Apple Speech (SFSpeechRecognizer)
+        if ((e.error === "network" || e.error === "service-not-allowed") && this.startNativeAppleSpeechFallback(lang, cb)) {
+          try {
+            rec.abort();
+          } catch {
+            /* ignore */
+          }
+          this.rec = null;
+          return;
+        }
         const code =
           e.error === "not-allowed" || e.error === "service-not-allowed"
             ? "not-allowed"
@@ -272,6 +439,7 @@ export class WebSTTEngine {
       };
 
       rec.onend = () => {
+        if (this.nativeEventSource || this.nativeWindowListener) return; // handed off to native SFSpeechRecognizer
         this.listening = false;
         this.stopMeter();
         const text = (this.finalText || this.interimText).trim();
@@ -284,6 +452,7 @@ export class WebSTTEngine {
       try {
         rec.start();
       } catch (e) {
+        if (this.startNativeAppleSpeechFallback(lang, cb)) return;
         this.listening = false;
         this.stopMeter();
         cb.onError("other", e instanceof Error ? e.message : String(e));
@@ -295,7 +464,12 @@ export class WebSTTEngine {
 
   stop() {
     this.clearSilenceTimer();
-    if (!this.rec) return;
+    this.cleanupNativeListeners();
+    if (!this.rec) {
+      this.listening = false;
+      this.stopMeter();
+      return;
+    }
     try {
       this.rec.stop();
     } catch {
@@ -306,11 +480,13 @@ export class WebSTTEngine {
 
   abort() {
     this.clearSilenceTimer();
-    if (!this.rec) return;
-    try {
-      this.rec.abort();
-    } catch {
-      /* noop */
+    this.cleanupNativeListeners();
+    if (this.rec) {
+      try {
+        this.rec.abort();
+      } catch {
+        /* noop */
+      }
     }
     this.listening = false;
     this.stopMeter();
@@ -319,16 +495,19 @@ export class WebSTTEngine {
 
 /* --------------------- voice command mapping (approvals) ----------------- */
 
+const ALLOW_SESSION_RE = /\b(allow\s+session|session\s+allow|session\s+ke\s+liye(\s+allow)?|for\s+session|hamesha\s+allow)\b/i;
 const ALLOW_RE = /\b(allow|yes|yep|haan|haa|ha|kar\s*do|kar\s*de|permission\s*di|proceed|theek\s*hai|theek|ok|okay|approve|allowed|chalo|chalega)\b/i;
 const DENY_RE = /\b(deny|no|nope|nahi|na|mat\s*kar|mat|ruk\s*jao|ruko|ruk|cancel|reject|stop|abort)\b/i;
 
-export function mapVoiceDecision(text: string): "allow" | "deny" | null {
+export function mapVoiceDecision(text: string): "allowOnce" | "allowSession" | "deny" | null {
   const s = text.toLowerCase().trim();
   if (!s) return null;
+  const allowSession = ALLOW_SESSION_RE.test(s);
   const allow = ALLOW_RE.test(s);
   const deny = DENY_RE.test(s);
-  if (allow && deny) return null;
-  if (allow) return "allow";
+  if ((allow || allowSession) && deny) return null;
+  if (allowSession) return "allowSession";
+  if (allow) return "allowOnce";
   if (deny) return "deny";
   return null;
 }

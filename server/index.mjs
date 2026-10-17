@@ -15,6 +15,7 @@
 //   • request bodies capped at 256 KB; media & static paths jailed to their roots
 
 import http from "node:http";
+import { spawn, execFile } from "node:child_process";
 import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,6 +39,48 @@ const config = loadConfig();
 const log = new Logger({ level: config.logging.level, redactEnabled: config.logging.redact });
 const router = new OmnirouteClient(config.omniroute.baseURL, log, { sqlitePath: config.omniroute.sqlitePath });
 const tasks = new TaskManager({ config, log });
+
+// macOS Audio Ducking state (server-side fallback when not inside WKWebView)
+let savedMacVolume = null;
+let isMacDucked = false;
+
+function runOsaScript(script) {
+  if (process.platform !== "darwin") return Promise.resolve(null);
+  return new Promise((res) => {
+    execFile("osascript", ["-e", script], { timeout: 2500 }, (err, stdout) => {
+      res(err ? null : stdout.trim());
+    });
+  });
+}
+
+async function duckMacAudio() {
+  if (process.platform !== "darwin") return { ok: true, ducked: false, platform: process.platform };
+  if (isMacDucked) return { ok: true, ducked: true, savedVolume: savedMacVolume };
+  const raw = await runOsaScript("output volume of (get volume settings)");
+  const current = raw !== null ? Number.parseInt(raw, 10) : Number.NaN;
+  if (!Number.isNaN(current)) {
+    savedMacVolume = current;
+    const target = Math.min(current, Math.max(10, Math.round(current * 0.35)));
+    if (target < current) {
+      await runOsaScript(`set volume output volume ${target}`);
+    }
+    isMacDucked = true;
+    return { ok: true, ducked: true, savedVolume: savedMacVolume, targetVolume: target };
+  }
+  return { ok: true, ducked: false };
+}
+
+async function restoreMacAudio() {
+  if (process.platform !== "darwin") return { ok: true, restored: false, platform: process.platform };
+  if (!isMacDucked) return { ok: true, restored: false };
+  const orig = savedMacVolume;
+  savedMacVolume = null;
+  isMacDucked = false;
+  if (typeof orig === "number" && !Number.isNaN(orig)) {
+    await runOsaScript(`set volume output volume ${Math.max(0, Math.min(100, orig))}`);
+  }
+  return { ok: true, restored: true, restoredVolume: orig };
+}
 
 const MIME = {
   html: "text/html; charset=utf-8",
@@ -374,10 +417,74 @@ export async function handleRequest(req, res) {
       );
       if (!out.ok) return send(res, 502, { ok: false, error: "ttsFailed", message: out.error, hint: out.hint ?? "pip install edge-tts" });
       log.info("tts", `synthesised ${out.bytes}B via ${out.engine}${out.cached ? " (cache)" : ""} in ${Date.now() - t0}ms`);
-      return send(res, 200, {
-        ...out,
-        url: `/api/media/${basename(out.file)}`,
-        audioUrl: `/api/media/${basename(out.file)}`,
+      const mediaUrl = `/api/media/${basename(out.file)}`;
+      return send(res, 200, { ...out, url: mediaUrl, audioUrl: mediaUrl });
+    }
+
+    /* ---------------------- audio ducking & native stt -------------------- */
+    if (m === "POST" && p === "/api/audio/duck") {
+      return send(res, 200, await duckMacAudio());
+    }
+    if (m === "POST" && p === "/api/audio/restore") {
+      return send(res, 200, await restoreMacAudio());
+    }
+    if (m === "GET" && p === "/api/stt/stream") {
+      const locale = url.searchParams.get("locale") || "en-IN";
+      const silenceMs = Number(url.searchParams.get("silenceMs") || 1800);
+      const compiledBin = resolve(join(DIST_DIR, "bin", "hv-stt"));
+      const swiftScript = resolve(join(HERE, "..", "app", "stt.swift"));
+
+      return sse(res, (sendEvt) => {
+        if (process.platform !== "darwin") {
+          sendEvt({ type: "error", error: "SFSpeechRecognizer requires macOS Darwin" });
+          return () => {};
+        }
+
+        const cmd = existsSync(compiledBin) ? compiledBin : "swift";
+        const args = existsSync(compiledBin)
+          ? ["--locale", locale, "--silence-ms", String(silenceMs)]
+          : [swiftScript, "--locale", locale, "--silence-ms", String(silenceMs)];
+
+        let child = null;
+        try {
+          child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+        } catch (err) {
+          sendEvt({ type: "error", error: `Failed to spawn native STT: ${err.message}` });
+          return () => {};
+        }
+
+        let buf = "";
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk) => {
+          buf += chunk;
+          let idx;
+          while ((idx = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, idx).trim();
+            buf = buf.slice(idx + 1);
+            if (!line) continue;
+            try {
+              sendEvt(JSON.parse(line));
+            } catch {
+              sendEvt({ type: "interim", text: line });
+            }
+          }
+        });
+        child.on("error", (err) => {
+          sendEvt({ type: "error", error: err.message });
+        });
+        child.on("close", () => {
+          sendEvt({ type: "end" }, "end");
+        });
+
+        return () => {
+          if (child && !child.killed) {
+            try {
+              child.kill("SIGTERM");
+            } catch {
+              /* ignore */
+            }
+          }
+        };
       });
     }
     const mediaMatch = p.match(/^\/api\/media\/([\w.-]+)$/);

@@ -72,14 +72,32 @@ export default function App() {
     return false;
   });
 
+  const [axWarning, setAxWarning] = useState<string | null>(null);
+
   useEffect(() => {
     const onResize = () => {
       if (window.innerWidth <= 520) {
         setHudPreviewMode(true);
       }
     };
+    const onSelectSession = () => {
+      setTab("sessions");
+      setDrawerOpen(true);
+    };
+    const onAxWarning = (e: Event) => {
+      const detail = (e as CustomEvent<{ trusted?: boolean; message?: string }>).detail;
+      if (detail && detail.trusted === false) {
+        setAxWarning(detail.message || "Accessibility permission missing for global ⌥Space hotkey.");
+      }
+    };
     window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    window.addEventListener("hv:select-session", onSelectSession);
+    window.addEventListener("hv:accessibility-warning", onAxWarning);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("hv:select-session", onSelectSession);
+      window.removeEventListener("hv:accessibility-warning", onAxWarning);
+    };
   }, []);
 
   const stateColor = STATE_COLOR[o.state];
@@ -93,6 +111,14 @@ export default function App() {
 
   return (
     <div className="app-canvas min-h-screen text-[var(--color-ink)]">
+      {axWarning && (
+        <div className="flex items-center justify-between border-b border-[rgba(245,158,11,0.35)] bg-[#23190b] px-4 py-1.5 font-mono text-[11px] text-[#fbbf24]">
+          <span>⚠︎ {axWarning}</span>
+          <button onClick={() => setAxWarning(null)} className="ml-3 text-[10px] underline opacity-80 hover:opacity-100">
+            Dismiss
+          </button>
+        </div>
+      )}
       {/* ------------------------------- top bar ------------------------------ */}
       <header className="sticky top-0 z-30 border-b border-[var(--color-line)] bg-[#0e0d0b]/90 backdrop-blur-xl">
         <div className="mx-auto flex max-w-[1440px] flex-wrap items-center gap-x-4 gap-y-2 px-4 py-2.5">
@@ -101,7 +127,7 @@ export default function App() {
             <div className="leading-none">
               <div className="flex items-center gap-2">
                 <span className="font-display text-[16px] font-800 tracking-[-0.02em] text-[var(--color-ink)]">Hermes Voice</span>
-                <span className="font-mono text-[10px] font-600 uppercase tracking-[0.12em] text-[var(--color-gold)]">v1.0</span>
+                <span className="font-mono text-[10px] font-600 uppercase tracking-[0.12em] text-[var(--color-gold)]">v1.1</span>
               </div>
               <div className="mt-1 font-mono text-[9.5px] uppercase tracking-[0.14em] text-[var(--color-muted)]">
                 macOS voice shell · stream-json
@@ -112,7 +138,7 @@ export default function App() {
           {/* Telemetry status strip: Model (KRITI / 9Router), Bridge 127.0.0.1:20130, TTS Engine */}
           <div className="ml-1 flex flex-wrap items-center gap-x-4 gap-y-1 border-l border-[var(--color-line)] pl-3">
             <Badge tone="gold" dot>
-              {o.activeModelLabel}
+              {o.activeModelBadge}
             </Badge>
             <Badge tone={o.backend.reachable ? "green" : "amber"} dot>
               127.0.0.1:20130 {o.backend.reachable ? "live" : "sim"}

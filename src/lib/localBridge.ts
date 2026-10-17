@@ -214,7 +214,8 @@ export class BridgeClient {
 
 export type ServerEvent =
   | { seq: number; at: number; taskId: string; type: "thinking"; payload: Record<string, never> }
-  | { seq: number; at: number; taskId: string; type: "progress"; payload: { text: string; raw?: boolean; parseError?: boolean; warning?: boolean; stream?: boolean } }
+  | { seq: number; at: number; taskId: string; type: "progress"; payload: { text: string; raw?: boolean; parseError?: boolean; warning?: boolean; stream?: boolean; isPing?: boolean; audioUrl?: string | null } }
+  | { seq: number; at: number; taskId: string; type: "progressPing"; payload: { text: string; audioUrl?: string | null; engine?: string; pingIndex?: number } }
   | { seq: number; at: number; taskId: string; type: "toolCall"; payload: { name: string; args: Record<string, string> } }
   | { seq: number; at: number; taskId: string; type: "permissionRequest"; payload: { request: PermissionRequest & { timeoutSec?: number } } }
   | { seq: number; at: number; taskId: string; type: "permissionDecision"; payload: { requestId: string; tool: string; decision: string; via: string; deliveredToAgent: boolean; risk?: string } }
@@ -253,8 +254,13 @@ export class LocalBridge implements AgentBridge {
           case "thinking":
             ctx.onEvent({ kind: "thinking", taskID: task.id });
             break;
+          case "progressPing":
+            ctx.onEvent({ kind: "progress", taskID: task.id, text: `🔊 ${evt.payload.text}` });
+            break;
           case "progress":
-            ctx.onEvent({ kind: "progress", taskID: task.id, text: evt.payload.text });
+            if (!evt.payload.isPing) {
+              ctx.onEvent({ kind: "progress", taskID: task.id, text: evt.payload.text });
+            }
             break;
           case "toolCall":
             ctx.onEvent({ kind: "toolCall", taskID: task.id, name: evt.payload.name, args: evt.payload.args });
