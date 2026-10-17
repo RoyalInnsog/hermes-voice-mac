@@ -1,27 +1,60 @@
 // src/lib/localBridge.ts — client for the real local bridge (server/index.mjs).
 //
 // This is the path that makes the product actually work: the Node bridge spawns
-// `hermes`, streams HV_* events over SSE, pauses on permission requests and takes
-// the decision back over HTTP. The browser never spawns anything itself.
+// `hermes`, streams stream-json & HV_* events over SSE, pauses on permission requests
+// and takes the decision back over HTTP. The browser never spawns anything itself.
 
 import type { AgentBridge, SendContext } from "./agentBridge";
-import type { ApprovalOutcome, AuditEntry, ComboInfo, HealthStatus, LogLine, ModelInfo, PermissionRequest, Session } from "./types";
+import type {
+  ApprovalOutcome,
+  AuditEntry,
+  ComboInfo,
+  HealthStatus,
+  LogLine,
+  ModelInfo,
+  PermissionRequest,
+  Session,
+} from "./types";
 
 export interface BridgeServerHealth {
   ok: boolean;
   service: string;
   version: string;
   node: string;
+  python?: string;
   uptimeSec: number;
   pid: number;
   dataDir: string;
-  hermes: { found: boolean; path?: string; detail: string; command: string[]; argvTemplate: string[]; cwd: string; timeoutSec: number };
-  omniroute: HealthStatus & { baseURL: string; probeModel: string; path?: string | null; status?: number | null };
-  tts: {
-    engines: Record<string, { available: boolean; detail: string; cost: string }>;
-    configured: { engine: string; voice: string; rate: string };
+  distReady?: boolean;
+  hermes: {
+    found: boolean;
+    path?: string;
+    detail: string;
+    command: string[];
+    argvTemplate: string[];
+    cwd: string;
+    timeoutSec: number;
   };
-  tasks: { live: number; total: number; cap: number; awaitingPermission: number };
+  omniroute: HealthStatus & {
+    baseURL: string;
+    probeModel: string;
+    activeCombo?: string;
+    path?: string | null;
+    status?: number | null;
+    sqlite?: {
+      available: boolean;
+      dbPath: string | null;
+      combosCount: number;
+      providersCount: number;
+      readOnly: boolean;
+    };
+  };
+  tts: {
+    engines: Record<string, { available: boolean; detail: string; cost: string; pythonPath?: string; version?: string | null }>;
+    configured: { engine: string; voice: string; rate: string };
+    cacheDir?: string;
+  };
+  tasks: { live: number; total: number; cap: number; awaitingPermission: number; activeModel?: string };
   permissions: { timeoutSec: number; autoApproveLowRisk: boolean };
   logging: { level: string; redact: boolean };
   protocol: Record<string, unknown>;
@@ -40,8 +73,21 @@ const START_HINT = "Bridge nahi chal raha. Terminal me: node server/index.mjs  (
 export class BridgeClient {
   constructor(public baseURL: string) {}
 
-  private url(path: string) {
+  resolveUrl(path: string) {
+    if (typeof window !== "undefined") {
+      const host = window.location.hostname;
+      if (
+        window.location.port === "20130" ||
+        (host !== "localhost" && host !== "127.0.0.1" && this.baseURL.includes("127.0.0.1:20130"))
+      ) {
+        return path;
+      }
+    }
     return this.baseURL.replace(/\/+$/, "") + path;
+  }
+
+  private url(path: string) {
+    return this.resolveUrl(path);
   }
 
   private async req<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
@@ -56,7 +102,11 @@ export class BridgeClient {
     }
     if (!res.ok) {
       const e = body as { error?: string; message?: string; hint?: string };
-      throw Object.assign(new Error(e?.message || `HTTP ${res.status}`), { code: e?.error, hint: e?.hint, status: res.status });
+      throw Object.assign(new Error(e?.message || `HTTP ${res.status}`), {
+        code: e?.error,
+        hint: e?.hint,
+        status: res.status,
+      });
     }
     return body as T;
   }
@@ -81,7 +131,9 @@ export class BridgeClient {
     return this.req("/api/router/combos", { timeoutMs: 15000 });
   }
 
-  async routerProbe(model: string): Promise<{ ok: boolean; latencyMs: number; model: string; sample?: string; error?: string }> {
+  async routerProbe(
+    model: string,
+  ): Promise<{ ok: boolean; latencyMs: number; model: string; sample?: string; error?: string }> {
     return this.req("/api/router/probe", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -90,7 +142,10 @@ export class BridgeClient {
     });
   }
 
-  async createTask(utterance: string, sessionId: string): Promise<{ task: { id: string; sessionId: string; status: string; argv: string[] }; eventsUrl: string }> {
+  async createTask(
+    utterance: string,
+    sessionId: string,
+  ): Promise<{ task: { id: string; sessionId: string; status: string; argv: string[]; model?: string }; eventsUrl: string }> {
     return this.req("/api/tasks", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -99,7 +154,11 @@ export class BridgeClient {
     });
   }
 
-  async decide(taskId: string, requestId: string, outcome: ApprovalOutcome): Promise<{ ok: boolean; deliveredToAgent: boolean }> {
+  async decide(
+    taskId: string,
+    requestId: string,
+    outcome: ApprovalOutcome,
+  ): Promise<{ ok: boolean; deliveredToAgent: boolean }> {
     return this.req(`/api/tasks/${taskId}/permissions/${requestId}/decision`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -132,7 +191,14 @@ export class BridgeClient {
     return this.req(`/api/memory/file?path=${encodeURIComponent(path)}`, { timeoutMs: 8000 });
   }
 
-  async tts(text: string, voice?: string, engine?: string): Promise<{ ok: true; url: string; engine: string; bytes: number; ms: number; spokenText: string } | { ok: false; error: string; message?: string; hint?: string }> {
+  async tts(
+    text: string,
+    voice?: string,
+    engine?: string,
+  ): Promise<
+    | { ok: true; url: string; engine: string; bytes: number; ms: number; spokenText: string; cached?: boolean }
+    | { ok: false; error: string; message?: string; hint?: string }
+  > {
     return this.req("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -142,7 +208,12 @@ export class BridgeClient {
   }
 
   async patchConfig(patch: Record<string, unknown>): Promise<{ ok: boolean }> {
-    return this.req("/api/config", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch), timeoutMs: 8000 });
+    return this.req("/api/config", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+      timeoutMs: 8000,
+    });
   }
 
   /** Streams task events; resolves when the bridge reports the terminal state. */
@@ -182,10 +253,42 @@ export class BridgeClient {
 
 export type ServerEvent =
   | { seq: number; at: number; taskId: string; type: "thinking"; payload: Record<string, never> }
-  | { seq: number; at: number; taskId: string; type: "progress"; payload: { text: string; raw?: boolean; parseError?: boolean; warning?: boolean } }
+  | {
+      seq: number;
+      at: number;
+      taskId: string;
+      type: "status";
+      payload: { subtype: string; model: string | null; sessionId: string | null };
+    }
+  | {
+      seq: number;
+      at: number;
+      taskId: string;
+      type: "progress";
+      payload: { text: string; raw?: boolean; parseError?: boolean; warning?: boolean; streamChunk?: boolean };
+    }
   | { seq: number; at: number; taskId: string; type: "toolCall"; payload: { name: string; args: Record<string, string> } }
-  | { seq: number; at: number; taskId: string; type: "permissionRequest"; payload: { request: PermissionRequest & { timeoutSec?: number } } }
-  | { seq: number; at: number; taskId: string; type: "permissionDecision"; payload: { requestId: string; tool: string; decision: string; via: string; deliveredToAgent: boolean; risk?: string } }
+  | {
+      seq: number;
+      at: number;
+      taskId: string;
+      type: "permissionRequest";
+      payload: { request: PermissionRequest & { timeoutSec?: number } };
+    }
+  | {
+      seq: number;
+      at: number;
+      taskId: string;
+      type: "permissionDecision";
+      payload: {
+        requestId: string;
+        tool: string;
+        decision: string;
+        via: string;
+        deliveredToAgent: boolean;
+        risk?: string;
+      };
+    }
   | { seq: number; at: number; taskId: string; type: "completed"; payload: { text: string; degraded?: string } }
   | { seq: number; at: number; taskId: string; type: "failed"; payload: { code: string; reason: string; hint?: string | null } }
   | { seq: number; at: number; taskId: string; type: "cancelled"; payload: Record<string, never> }
@@ -227,8 +330,22 @@ export class LocalBridge implements AgentBridge {
           case "thinking":
             ctx.onEvent({ kind: "thinking", taskID: task.id });
             break;
+          case "status":
+            ctx.onEvent({
+              kind: "status",
+              taskID: task.id,
+              subtype: evt.payload.subtype,
+              model: evt.payload.model,
+              sessionId: evt.payload.sessionId,
+            });
+            break;
           case "progress":
-            ctx.onEvent({ kind: "progress", taskID: task.id, text: evt.payload.text });
+            ctx.onEvent({
+              kind: "progress",
+              taskID: task.id,
+              text: evt.payload.text,
+              streamChunk: evt.payload.streamChunk,
+            });
             break;
           case "toolCall":
             ctx.onEvent({ kind: "toolCall", taskID: task.id, name: evt.payload.name, args: evt.payload.args });
@@ -236,7 +353,10 @@ export class LocalBridge implements AgentBridge {
           case "permissionRequest": {
             const req = evt.payload.request;
             const timeoutSec = req.timeoutSec ?? 60;
-            const full: PermissionRequest = { ...req, expiresAt: req.expiresAt || Date.now() + timeoutSec * 1000 };
+            const full: PermissionRequest = {
+              ...req,
+              expiresAt: req.expiresAt || Date.now() + timeoutSec * 1000,
+            };
             timers.set(req.id, timeoutSec);
             ctx.onEvent({ kind: "permissionRequest", taskID: task.id, request: full });
             void ctx.requestApproval(full).then(async (outcome) => {
@@ -245,9 +365,14 @@ export class LocalBridge implements AgentBridge {
                 await this.client.decide(task.id, req.id, outcome);
               } catch (e) {
                 const err = e as Error & { hint?: string };
-                ctx.onEvent({ kind: "progress", taskID: task.id, text: `⚠︎ decision rejected by bridge: ${err.message}${err.hint ? ` (${err.hint})` : ""}` });
-                // If the server refused (e.g. critical without typed ALLOW), deny so the agent can move on.
-                if (outcome.decision !== "deny") await this.client.decide(task.id, req.id, { decision: "deny", via: "click" }).catch(() => {});
+                ctx.onEvent({
+                  kind: "progress",
+                  taskID: task.id,
+                  text: `⚠︎ decision rejected by bridge: ${err.message}${err.hint ? ` (${err.hint})` : ""}`,
+                });
+                if (outcome.decision !== "deny") {
+                  await this.client.decide(task.id, req.id, { decision: "deny", via: "click" }).catch(() => {});
+                }
               }
             });
             break;
@@ -263,7 +388,11 @@ export class LocalBridge implements AgentBridge {
             ctx.onEvent({ kind: "completed", taskID: task.id, text: evt.payload.text });
             break;
           case "failed":
-            ctx.onEvent({ kind: "failed", taskID: task.id, reason: `[${evt.payload.code}] ${evt.payload.reason}` });
+            ctx.onEvent({
+              kind: "failed",
+              taskID: task.id,
+              reason: `[${evt.payload.code}] ${evt.payload.reason}`,
+            });
             break;
           case "cancelled":
             ctx.onEvent({ kind: "cancelled", taskID: task.id });

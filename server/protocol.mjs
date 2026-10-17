@@ -1,18 +1,18 @@
 // server/protocol.mjs — Hermes wire protocol (server side).
-// Identical semantics to src/lib/agentBridge.ts so browser and Node agree.
-//
-// Wire format (one JSON object per stdout line, marker-prefixed):
-//   HV_EVENT:    {"kind":"thinking|toolCall|progress|completed|failed|cancelled", ...}
-//   HV_PERM:     {"tool":"shell","args":{...},"reason":"...","risk":"high"?, "id"?}
-//   HV_PROGRESS: <free text>
-//   <anything else> = plain assistant text (graceful fallback)
+// Supports BOTH:
+//   1. Real Hermes CLI `--format stream-json` line-delimited JSON chunks:
+//      {"type":"system","subtype":"init","model":"...","session_id":"..."}
+//      {"type":"text","text":"..."}
+//      {"type":"tool_call","name":"...","arguments":{...}}
+//      {"type":"result","text":"...","exit_code":0}
+//   2. Legacy HV_* wire markers:
+//      HV_EVENT:    {"kind":"thinking|toolCall|progress|completed|failed|cancelled", ...}
+//      HV_PERM:     {"tool":"shell","args":{...},"reason":"...","risk":"high"?, "id"?}
+//      HV_PROGRESS: <free text>
+//      <anything else> = plain assistant text (graceful fallback)
 //
 // Decision written back to the child's stdin:
 //   HV_DECISION: {"id":"<permId>","decision":"allowOnce|allowSession|deny"}
-//
-// TODO-VERIFY: whether the installed `hermes` emits any of this. If it does not,
-// the bridge degrades to "whole stdout = final response" and permission
-// interception is unavailable (LIMITATIONS L-2). Run: hermes chat --help
 
 import { classifyRisk } from "./risk.mjs";
 
@@ -23,9 +23,29 @@ export const MARKERS = {
   decision: "HV_DECISION:",
 };
 
-export const EVENT_KINDS = ["thinking", "toolCall", "progress", "completed", "failed", "cancelled"];
+export const EVENT_KINDS = ["thinking", "toolCall", "progress", "completed", "failed", "cancelled", "status"];
 export const RISKS = ["low", "medium", "high", "critical"];
 export const DECISIONS = ["allowOnce", "allowSession", "deny"];
+
+function normalizeArgs(rawArgs) {
+  if (!rawArgs) return {};
+  if (typeof rawArgs === "string") {
+    try {
+      const parsed = JSON.parse(rawArgs);
+      return parsed && typeof parsed === "object" ? parsed : { value: rawArgs };
+    } catch {
+      return { cmd: rawArgs };
+    }
+  }
+  if (typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+    const out = {};
+    for (const [k, v] of Object.entries(rawArgs)) {
+      out[k] = typeof v === "string" ? v : JSON.stringify(v);
+    }
+    return out;
+  }
+  return {};
+}
 
 export function parseLine(line, taskID) {
   const trimmed = (line ?? "").replace(/\r$/, "").trim();
@@ -40,7 +60,7 @@ export function parseLine(line, taskID) {
     try {
       const o = JSON.parse(raw);
       const toolName = String(o.tool ?? "unknown_tool");
-      const args = o.args && typeof o.args === "object" ? o.args : {};
+      const args = normalizeArgs(o.args);
       const classified = classifyRisk(toolName, args);
       const risk = RISKS.includes(o.risk) ? o.risk : classified.risk;
       return {
@@ -62,7 +82,7 @@ export function parseLine(line, taskID) {
         case "thinking":
           return { type: "event", event: { kind, taskID } };
         case "toolCall":
-          return { type: "event", event: { kind, taskID, name: String(o.name ?? "tool"), args: o.args ?? {} } };
+          return { type: "event", event: { kind, taskID, name: String(o.name ?? "tool"), args: normalizeArgs(o.args) } };
         case "progress":
           return { type: "event", event: { kind, taskID, text: String(o.text ?? "") } };
         case "completed":
@@ -71,9 +91,73 @@ export function parseLine(line, taskID) {
           return { type: "event", event: { kind, taskID, reason: String(o.reason ?? "unknown") } };
         case "cancelled":
           return { type: "event", event: { kind, taskID } };
+        case "status":
+          return {
+            type: "streamSystem",
+            subtype: String(o.subtype ?? "init"),
+            model: o.model ? String(o.model) : null,
+            sessionId: o.session_id ? String(o.session_id) : null,
+          };
       }
     } catch (e) {
       return { type: "parseError", raw, error: e.message };
+    }
+  }
+
+  // Hermes CLI `--format stream-json` line-delimited JSON objects
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    try {
+      const o = JSON.parse(trimmed);
+      if (o && typeof o === "object" && typeof o.type === "string") {
+        switch (o.type) {
+          case "system":
+            return {
+              type: "streamSystem",
+              subtype: String(o.subtype ?? "init"),
+              model: o.model ? String(o.model) : null,
+              sessionId: o.session_id ? String(o.session_id) : null,
+            };
+          case "text":
+          case "assistant":
+          case "content_block_delta": {
+            const text = String(o.text ?? o.delta?.text ?? o.content ?? "");
+            return { type: "streamText", text };
+          }
+          case "tool_call":
+          case "tool_use": {
+            const toolName = String(o.name ?? o.tool ?? "unknown_tool");
+            const args = normalizeArgs(o.arguments ?? o.args ?? o.input);
+            const classified = classifyRisk(toolName, args);
+            const risk = RISKS.includes(o.risk) ? o.risk : classified.risk;
+            const id = String(o.id ?? crypto.randomUUID());
+            return {
+              type: "streamToolCall",
+              toolName,
+              args,
+              risk,
+              reason: o.reason ?? classified.note,
+              request: { id, taskID, toolName, args, risk, reason: o.reason ?? classified.note },
+            };
+          }
+          case "result": {
+            const exitCode = typeof o.exit_code === "number" ? o.exit_code : 0;
+            const text = String(o.text ?? o.result ?? o.output ?? "");
+            return {
+              type: "streamResult",
+              text,
+              exitCode,
+              error: o.error ? String(o.error) : null,
+            };
+          }
+          case "error":
+            return {
+              type: "event",
+              event: { kind: "failed", taskID, reason: String(o.message ?? o.error ?? "stream-json error") },
+            };
+        }
+      }
+    } catch {
+      /* Not valid stream-json; fall through to plain text */
     }
   }
 
@@ -84,10 +168,14 @@ export function encodeDecision(id, decision) {
   return `${MARKERS.decision} ${JSON.stringify({ id, decision })}\n`;
 }
 
-/** argv for the agent call. TODO-VERIFY against `hermes chat --help`. */
+/**
+ * Build argv for the agent call.
+ * When argvTemplate is explicitly supplied (e.g. from config.mjs with `--format stream-json`),
+ * substitutes {{utterance}} and {{sessionId}}.
+ */
 export function buildArgv({ utterance, sessionId, argvTemplate }) {
   const tpl = argvTemplate && argvTemplate.length ? argvTemplate : ["chat", "-q", "{{utterance}}", "--session", "{{sessionId}}"];
-  return tpl.map((part) => part.replaceAll("{{utterance}}", utterance).replaceAll("{{sessionId}}", sessionId));
+  return tpl.map((part) => part.replaceAll("{{utterance}}", utterance).replaceAll("{{sessionId}}", sessionId ?? ""));
 }
 
 /**

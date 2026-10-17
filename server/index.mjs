@@ -1,22 +1,30 @@
-// server/index.mjs — Hermes Voice local bridge (zero dependencies, Node >= 18).
+// server/index.mjs — Hermes Voice v1.0 Production Local Server & Bridge (zero dependencies, Node >= 18).
 //
 //   node server/index.mjs          → http://127.0.0.1:20130
 //
-// Why this exists: a web page cannot spawn `hermes`, cannot reach 127.0.0.1:20128
-// through CORS, and cannot run edge-tts. This loopback bridge does all three and
-// exposes them as a small HTTP/SSE API the UI consumes.
+// Serves the production Vite `dist/` singlefile UI on `GET /` and all static assets,
+// plus the full `/api/*` REST + SSE bridge for Hermes CLI, Edge TTS, and OmniRoute.
 //
 // Security posture:
-//   • binds 127.0.0.1 only, and rejects any non-loopback peer
-//   • CORS limited to configured local origins
-//   • every response body is redacted at the sink
-//   • no mutating request is ever forwarded to Omniroute
-//   • request bodies capped at 256 KB; media paths jailed to the scratch dir
+//   • binds 127.0.0.1 by default, and rejects non-loopback peers (unless HV_ALLOW_PROXY=1)
+//   • CORS limited to local origins
+//   • every response body and log is redacted at the sink
+//   • no mutating request is ever forwarded to OmniRoute; SQLite is strictly read-only (mode=ro)
+//   • request bodies capped at 256 KB; static & media paths jailed to their directories
 
 import http from "node:http";
 import { createReadStream, existsSync, statSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
-import { ensureDirs, loadConfig, saveConfig, SCRATCH_DIR, DATA_DIR } from "./config.mjs";
+import { basename, extname, join, resolve } from "node:path";
+import {
+  ensureDirs,
+  loadConfig,
+  saveConfig,
+  SCRATCH_DIR,
+  TTS_CACHE_DIR,
+  DATA_DIR,
+  DIST_DIR,
+  resolvePython,
+} from "./config.mjs";
 import { Logger } from "./logger.mjs";
 import { OmnirouteClient } from "./omniroute.mjs";
 import { TaskManager, TaskError } from "./agent.mjs";
@@ -26,27 +34,49 @@ import { cleanScratch } from "./store.mjs";
 import { EVENT_KINDS, MARKERS } from "./protocol.mjs";
 import { runServerTests } from "./selftest.mjs";
 
-const VERSION = "0.2.0";
+const VERSION = "1.0.0";
 const startedAt = Date.now();
 
 ensureDirs();
 const config = loadConfig();
 const log = new Logger({ level: config.logging.level, redactEnabled: config.logging.redact });
-const router = new OmnirouteClient(config.omniroute.baseURL, log);
+const router = new OmnirouteClient(config.omniroute.baseURL, log, config.omniroute.sqlitePath);
 const tasks = new TaskManager({ config, log });
 
-const MIME = { mp3: "audio/mpeg", aiff: "audio/aiff", wav: "audio/wav", json: "application/json", txt: "text/plain" };
+const MIME = {
+  html: "text/html; charset=utf-8",
+  js: "application/javascript; charset=utf-8",
+  mjs: "application/javascript; charset=utf-8",
+  css: "text/css; charset=utf-8",
+  json: "application/json; charset=utf-8",
+  svg: "image/svg+xml",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  ico: "image/x-icon",
+  woff2: "font/woff2",
+  mp3: "audio/mpeg",
+  aiff: "audio/aiff",
+  wav: "audio/wav",
+  txt: "text/plain; charset=utf-8",
+};
 
 /* ------------------------------- helpers -------------------------------- */
 
 function send(res, status, body, headers = {}) {
   const payload = typeof body === "string" ? body : JSON.stringify(body);
-  res.writeHead(status, { "Content-Type": typeof body === "string" ? "text/plain; charset=utf-8" : "application/json; charset=utf-8", ...headers });
+  res.writeHead(status, {
+    "Content-Type":
+      typeof body === "string" ? "text/plain; charset=utf-8" : "application/json; charset=utf-8",
+    ...headers,
+  });
   res.end(payload);
 }
 
 function fail(res, err) {
-  if (err instanceof TaskError) return send(res, err.status, { error: err.code, message: err.message, hint: err.hint });
+  if (err instanceof TaskError) {
+    return send(res, err.status, { error: err.code, message: err.message, hint: err.hint });
+  }
   const status = err.status || 500;
   log.error("app", `${err.message}`);
   send(res, status, { error: status >= 500 ? "internal" : "badRequest", message: err.message, hint: null });
@@ -78,16 +108,26 @@ function readBody(req, limit = 256 * 1024) {
   });
 }
 
-const isLoopback = (addr) => !addr || addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1" || addr.startsWith("::ffff:127.");
+const isLoopback = (addr) =>
+  process.env.HV_ALLOW_PROXY === "1" ||
+  !addr ||
+  addr === "127.0.0.1" ||
+  addr === "::1" ||
+  addr === "::ffff:127.0.0.1" ||
+  addr.startsWith("::ffff:127.");
 
 function cors(req, res) {
   const origin = req.headers.origin;
-  const allowed = origin && (config.allowedOrigins.includes(origin) || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin));
+  const allowed =
+    origin &&
+    (config.allowedOrigins.includes(origin) ||
+      /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ||
+      (process.env.HV_ALLOW_PROXY === "1" && /^https?:\/\//.test(origin)));
   if (allowed) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
     res.setHeader("Access-Control-Max-Age", "600");
   }
   res.setHeader("Cache-Control", "no-store");
@@ -101,8 +141,8 @@ function sse(res, onReady) {
     Connection: "keep-alive",
     "X-Accel-Buffering": "no",
   });
-  res.write(`retry: 2000\n\n`);
-  const send = (data, event) => {
+  res.write("retry: 2000\n\n");
+  const sendEvt = (data, event) => {
     try {
       if (event) res.write(`event: ${event}\n`);
       res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -111,11 +151,13 @@ function sse(res, onReady) {
       return false;
     }
   };
-  const cleanup = onReady(send);
+  const cleanup = onReady(sendEvt);
   const beat = setInterval(() => {
     try {
       res.write(": keep-alive\n\n");
-    } catch { /* closed */ }
+    } catch {
+      /* closed */
+    }
   }, 15000);
   res.on("close", () => {
     clearInterval(beat);
@@ -123,17 +165,45 @@ function sse(res, onReady) {
   });
 }
 
+function serveStaticAsset(p, res) {
+  const distRoot = resolve(DIST_DIR);
+  const rel = p === "/" ? "index.html" : p.replace(/^\/+/, "");
+  const target = resolve(distRoot, rel);
+  if (!target.startsWith(distRoot + "/") && target !== join(distRoot, "index.html")) {
+    return false;
+  }
+  if (!existsSync(target)) return false;
+  const st = statSync(target);
+  if (!st.isFile()) return false;
+  const ext = extname(target).slice(1).toLowerCase();
+  res.writeHead(200, {
+    "Content-Type": MIME[ext] ?? "application/octet-stream",
+    "Content-Length": st.size,
+  });
+  createReadStream(target).pipe(res);
+  return true;
+}
+
 /* --------------------------------- routes -------------------------------- */
 
 const PROTOCOL_DOC = {
+  streamJson: {
+    command: 'hermes chat -q "<utterance>" --format stream-json',
+    events: [
+      '{"type":"system","subtype":"init","model":"...","session_id":"..."} -> status',
+      '{"type":"text","text":"..."} -> streaming text chunk',
+      '{"type":"tool_call","name":"...","arguments":{...}} -> permission request if risk >= medium',
+      '{"type":"result","text":"...","exit_code":0} -> completed',
+    ],
+  },
   stdout: {
     [MARKERS.event]: `{ kind: one of ${JSON.stringify(EVENT_KINDS)}, ...payload }`,
-    [MARKERS.perm]: '{ tool, args{}, reason?, risk? (computed if absent), id? }',
+    [MARKERS.perm]: "{ tool, args{}, reason?, risk? (computed if absent), id? }",
     [MARKERS.progress]: "<free text>",
-    "unmarked line": "treated as plain assistant text; whole stdout becomes the answer if no HV_EVENT:completed arrives",
+    "unmarked line": "treated as plain assistant text; whole stdout becomes the answer if no structured completed event arrives",
   },
   stdin: { [MARKERS.decision]: "{ id, decision: allowOnce|allowSession|deny }" },
-  note: "TODO-VERIFY against `hermes chat --help`. If Hermes cannot emit these markers, permission interception is unavailable (LIMITATIONS L-2) — the bridge still returns its raw stdout.",
+  note: "Supports both Hermes `--format stream-json` and legacy HV_* markers with raw stdout fallback.",
 };
 
 const server = http.createServer(async (req, res) => {
@@ -151,18 +221,43 @@ const server = http.createServer(async (req, res) => {
   try {
     /* ---------------------------- bridge health --------------------------- */
     if (m === "GET" && p === "/api/health") {
-      const [hermes, ttsEngines, omni] = await Promise.all([tasks.resolveBinary(), detectEngines(null), router.health()]);
+      const [hermes, ttsEngines, omni, sqlite] = await Promise.all([
+        tasks.resolveBinary(),
+        detectEngines(null),
+        router.health(),
+        router.inspectSqlite(),
+      ]);
       return send(res, 200, {
         ok: true,
         service: "hermes-voice-bridge",
         version: VERSION,
         node: process.version,
+        python: resolvePython(),
         uptimeSec: Math.round((Date.now() - startedAt) / 1000),
         pid: process.pid,
         dataDir: DATA_DIR,
-        hermes: { ...hermes, command: config.hermes.command, argvTemplate: config.hermes.argvTemplate, cwd: config.hermes.cwd, timeoutSec: config.hermes.timeoutSec },
-        omniroute: { ...omni, baseURL: config.omniroute.baseURL, probeModel: config.omniroute.probeModel },
-        tts: { engines: ttsEngines, configured: config.tts },
+        distReady: existsSync(join(DIST_DIR, "index.html")),
+        hermes: {
+          ...hermes,
+          command: config.hermes.command,
+          argvTemplate: config.hermes.argvTemplate,
+          cwd: config.hermes.cwd,
+          timeoutSec: config.hermes.timeoutSec,
+        },
+        omniroute: {
+          ...omni,
+          baseURL: config.omniroute.baseURL,
+          probeModel: config.omniroute.probeModel,
+          activeCombo: config.omniroute.activeCombo ?? "KRITI / 9Router",
+          sqlite: {
+            available: sqlite.available,
+            dbPath: sqlite.dbPath,
+            combosCount: sqlite.combos?.length ?? 0,
+            providersCount: sqlite.providers?.length ?? 0,
+            readOnly: true,
+          },
+        },
+        tts: { engines: ttsEngines, configured: config.tts, cacheDir: TTS_CACHE_DIR },
         tasks: tasks.stats(),
         permissions: config.permissions,
         logging: config.logging,
@@ -176,8 +271,13 @@ const server = http.createServer(async (req, res) => {
     if (m === "GET" && p === "/api/config") return send(res, 200, { config, file: `${DATA_DIR}/config.json` });
     if (m === "PATCH" && p === "/api/config") {
       const patch = await readBody(req);
-      // Whitelist — an arbitrary deep patch could repoint the binary at anything.
-      const allowed = { hermes: ["command", "argvTemplate", "cwd", "timeoutSec"], omniroute: ["baseURL", "probeModel"], tts: ["engine", "voice", "rate"], permissions: ["timeoutSec", "autoApproveLowRisk"], logging: ["level", "redact"] };
+      const allowed = {
+        hermes: ["command", "argvTemplate", "cwd", "timeoutSec"],
+        omniroute: ["baseURL", "probeModel", "activeCombo"],
+        tts: ["engine", "voice", "englishVoice", "usVoice", "rate"],
+        permissions: ["timeoutSec", "autoApproveLowRisk"],
+        logging: ["level", "redact"],
+      };
       const safe = {};
       for (const [section, keys] of Object.entries(allowed)) {
         if (patch[section]) {
@@ -186,6 +286,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
       const next = saveConfig(safe);
+      Object.assign(config, next);
       log.configure(next.logging);
       log.info("app", `config patched: ${JSON.stringify(safe)}`);
       return send(res, 200, { ok: true, config: next });
@@ -193,16 +294,24 @@ const server = http.createServer(async (req, res) => {
 
     /* ---------------------- omniroute (read-only proxy) -------------------- */
     if (m === "GET" && p === "/api/router/health") return send(res, 200, await router.health());
+    if (m === "GET" && p === "/api/router/sqlite") return send(res, 200, await router.inspectSqlite());
     if (m === "GET" && p === "/api/router/models") {
       try {
         return send(res, 200, { models: await router.models() });
       } catch (e) {
-        return send(res, 502, { error: "omnirouteModelsFailed", message: e.message, hint: `curl -sS ${config.omniroute.baseURL}/v1/models` });
+        return send(res, 502, {
+          error: "omnirouteModelsFailed",
+          message: e.message,
+          hint: `curl -sS ${config.omniroute.baseURL}/v1/models`,
+        });
       }
     }
     if (m === "GET" && p === "/api/router/combos") {
       const r = await router.combos();
-      return send(res, 200, { ...r, note: r.pathUsed ? "read-only" : "TODO-VERIFY: no combo endpoint answered (LIMITATIONS L-8)" });
+      return send(res, 200, {
+        ...r,
+        note: r.pathUsed ? "read-only" : "no combo endpoint or SQLite DB answered (strict read-only)",
+      });
     }
     if (m === "POST" && p === "/api/router/probe") {
       const { model } = await readBody(req);
@@ -215,7 +324,11 @@ const server = http.createServer(async (req, res) => {
     /* -------------------------------- tasks ------------------------------- */
     if (m === "POST" && p === "/api/tasks") {
       const body = await readBody(req);
-      const task = await tasks.start({ utterance: body.utterance, sessionId: body.sessionId, meta: body.meta });
+      const task = await tasks.start({
+        utterance: body.utterance,
+        sessionId: body.sessionId,
+        meta: body.meta,
+      });
       log.info("agent", `task created ${task.id} for session ${task.sessionId}`);
       return send(res, 201, { task, eventsUrl: `/api/tasks/${task.id}/events` });
     }
@@ -229,12 +342,12 @@ const server = http.createServer(async (req, res) => {
     if (m === "GET" && eventsMatch) {
       const id = eventsMatch[1];
       const after = Number(url.searchParams.get("after") ?? 0);
-      return sse(res, (send) => {
-        for (const e of tasks.eventsSince(id, after)) send(e);
-        const unsub = tasks.subscribe(id, (e) => send(e));
+      return sse(res, (sendEvt) => {
+        for (const e of tasks.eventsSince(id, after)) sendEvt(e);
+        const unsub = tasks.subscribe(id, (e) => sendEvt(e));
         const task = tasks.get(id);
         if (["done", "failed", "cancelled"].includes(task.status)) {
-          send({ type: "end", taskId: id }, "end");
+          sendEvt({ type: "end", taskId: id }, "end");
           return unsub;
         }
         return unsub;
@@ -244,36 +357,80 @@ const server = http.createServer(async (req, res) => {
     const decideMatch = p.match(/^\/api\/tasks\/([\w-]+)\/permissions\/([\w-]+)\/decision$/);
     if (m === "POST" && decideMatch) {
       const body = await readBody(req);
-      const out = tasks.decide({ taskId: decideMatch[1], requestId: decideMatch[2], decision: body.decision, via: body.via ?? "click", typedConfirm: body.typedConfirm ?? null });
+      const out = tasks.decide({
+        taskId: decideMatch[1],
+        requestId: decideMatch[2],
+        decision: body.decision,
+        via: body.via ?? "click",
+        typedConfirm: body.typedConfirm ?? null,
+      });
       return send(res, 200, { ok: true, ...out });
     }
 
     /* --------------------------------- tts -------------------------------- */
-    if (m === "GET" && p === "/api/tts/engines") return send(res, 200, { engines: await detectEngines(log), configured: config.tts });
+    if (m === "GET" && p === "/api/tts/engines") {
+      return send(res, 200, { engines: await detectEngines(log), configured: config.tts, cacheDir: TTS_CACHE_DIR });
+    }
     if (m === "POST" && p === "/api/tts") {
       const body = await readBody(req);
       const engine = body.engine ?? (config.tts.engine === "gemini" ? "auto" : config.tts.engine);
       const t0 = Date.now();
       const out = await synthesize(
-        { text: body.text, voice: body.voice ?? config.tts.voice, rate: body.rate ?? config.tts.rate, engine },
+        {
+          text: body.text,
+          voice: body.voice ?? config.tts.voice,
+          rate: body.rate ?? config.tts.rate,
+          engine,
+        },
         log,
       );
-      if (!out.ok) return send(res, 502, { ok: false, error: "ttsFailed", message: out.error, hint: out.hint ?? "pip install edge-tts" });
+      if (!out.ok) {
+        return send(res, 502, {
+          ok: false,
+          error: "ttsFailed",
+          message: out.error,
+          hint: out.hint ?? "pip install edge-tts",
+        });
+      }
       log.info("tts", `synthesised ${out.bytes}B via ${out.engine} in ${Date.now() - t0}ms`);
+      if (body.stream === true || req.headers.accept === "audio/mpeg") {
+        res.writeHead(200, {
+          "Content-Type": out.mime || "audio/mpeg",
+          "Content-Length": out.bytes,
+        });
+        return createReadStream(out.file).pipe(res);
+      }
       return send(res, 200, { ...out, url: `/api/media/${basename(out.file)}` });
     }
+
     const mediaMatch = p.match(/^\/api\/media\/([\w.-]+)$/);
     if (m === "GET" && mediaMatch) {
       const name = basename(mediaMatch[1]).replace(/[^A-Za-z0-9._-]/g, "");
-      const file = resolve(join(SCRATCH_DIR, name));
-      if (!file.startsWith(resolve(SCRATCH_DIR)) || !existsSync(file)) return send(res, 404, { error: "notFound", message: "no such media file" });
-      const ext = name.split(".").pop();
-      res.writeHead(200, { "Content-Type": MIME[ext] ?? "application/octet-stream", "Content-Length": statSync(file).size });
+      const candidateScratch = resolve(join(SCRATCH_DIR, name));
+      const candidateCache = resolve(join(TTS_CACHE_DIR, name));
+      let file = null;
+      if (candidateScratch.startsWith(resolve(SCRATCH_DIR)) && existsSync(candidateScratch)) {
+        file = candidateScratch;
+      } else if (candidateCache.startsWith(resolve(TTS_CACHE_DIR)) && existsSync(candidateCache)) {
+        file = candidateCache;
+      }
+      if (!file) return send(res, 404, { error: "notFound", message: "no such media file" });
+      const ext = name.split(".").pop().toLowerCase();
+      res.writeHead(200, {
+        "Content-Type": MIME[ext] ?? "application/octet-stream",
+        "Content-Length": statSync(file).size,
+        "Accept-Ranges": "bytes",
+      });
       return createReadStream(file).pipe(res);
     }
 
     /* -------------------------------- audit ------------------------------- */
-    if (m === "GET" && p === "/api/audit") return send(res, 200, { entries: store.listAudit(Number(url.searchParams.get("limit") ?? 500)), file: store.roots().audit });
+    if (m === "GET" && p === "/api/audit") {
+      return send(res, 200, {
+        entries: store.listAudit(Number(url.searchParams.get("limit") ?? 500)),
+        file: store.roots().audit,
+      });
+    }
     if (m === "DELETE" && p === "/api/audit") {
       store.clearAudit();
       log.warn("permissions", "audit log cleared by user");
@@ -296,26 +453,54 @@ const server = http.createServer(async (req, res) => {
       try {
         return send(res, 200, store.readMemoryFile(rel));
       } catch (e) {
-        return send(res, e.status ?? 500, { error: "memoryReadFailed", message: e.message, hint: "read-only view of ~/.hermes/memories" });
+        return send(res, e.status ?? 500, {
+          error: "memoryReadFailed",
+          message: e.message,
+          hint: "read-only view of ~/.hermes/memories",
+        });
       }
     }
 
     /* --------------------------------- logs ------------------------------- */
-    if (m === "GET" && p === "/api/logs") return send(res, 200, { lines: log.tail(Number(url.searchParams.get("limit") ?? 200), url.searchParams.get("level") ?? "debug") });
+    if (m === "GET" && p === "/api/logs") {
+      return send(res, 200, {
+        lines: log.tail(Number(url.searchParams.get("limit") ?? 200), url.searchParams.get("level") ?? "debug"),
+      });
+    }
     if (m === "GET" && p === "/api/logs/export") {
-      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Content-Disposition": "attachment; filename=hermes-voice-bridge.log" });
+      res.writeHead(200, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Disposition": "attachment; filename=hermes-voice-bridge.log",
+      });
       return res.end(log.exportText());
     }
-    if (m === "GET" && p === "/api/logs/stream") return sse(res, (send) => log.subscribe((line) => send(line)));
+    if (m === "GET" && p === "/api/logs/stream") return sse(res, (sendEvt) => log.subscribe((line) => sendEvt(line)));
 
     /* ------------------------------- self-test ---------------------------- */
     if (m === "GET" && p === "/api/selftest") {
       const results = await runServerTests();
-      return send(res, 200, { results, passed: results.filter((r) => r.ok).length, total: results.length });
+      return send(res, 200, {
+        results,
+        passed: results.filter((r) => r.ok).length,
+        total: results.length,
+      });
     }
 
-    if (m === "GET" && (p === "/" || p === "/api")) {
+    if (m === "GET" && p === "/api") {
       return send(res, 200, `Hermes Voice bridge v${VERSION} — loopback only. Try /api/health\n`);
+    }
+
+    /* ---------------------- static UI serving (dist/) --------------------- */
+    if (m === "GET" && !p.startsWith("/api/")) {
+      if (serveStaticAsset(p, res)) return;
+      if (p === "/") {
+        return send(
+          res,
+          200,
+          `<!doctype html><html><head><meta charset="utf-8"><title>Hermes Voice v${VERSION}</title></head><body style="background:#0e0d0b;color:#f5f0e6;font-family:system-ui;padding:2rem"><h1>Hermes Voice Bridge v${VERSION}</h1><p>Run <code>npm run build</code> to generate <code>dist/index.html</code>. API health: <a style="color:#e5a93c" href="/api/health">/api/health</a></p></body></html>`,
+          { "Content-Type": "text/html; charset=utf-8" },
+        );
+      }
     }
 
     return send(res, 404, { error: "notFound", message: `no route ${m} ${p}` });
@@ -326,8 +511,11 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(config.port, config.host, () => {
   log.info("app", `Hermes Voice bridge v${VERSION} listening on http://${config.host}:${config.port}`);
-  log.info("app", `data dir: ${DATA_DIR}`);
-  log.info("permissions", `timeout=${config.permissions.timeoutSec}s autoApproveLowRisk=${config.permissions.autoApproveLowRisk} maxConcurrentTasks=${config.maxConcurrentTasks}`);
+  log.info("app", `data dir: ${DATA_DIR} · dist dir: ${DIST_DIR}`);
+  log.info(
+    "permissions",
+    `timeout=${config.permissions.timeoutSec}s autoApproveLowRisk=${config.permissions.autoApproveLowRisk} maxConcurrentTasks=${config.maxConcurrentTasks}`,
+  );
   cleanScratch();
 });
 

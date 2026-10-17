@@ -1,12 +1,18 @@
 {
-  "name": "react-vite-tailwind",
+  "name": "hermes-voice-mac",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
+  "description": "macOS Voice Assistant Frontend & Local Loopback Bridge for Hermes Agent connected to OmniRoute",
   "type": "module",
   "scripts": {
+    "start": "node server/index.mjs",
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node server/selftest.mjs",
+    "probe": "node scripts/probe-bridge.mjs",
+    "verify": "node scripts/verify-v1.mjs",
+    "build:app": "bash scripts/build-macos-app.sh"
   },
   "dependencies": {
     "clsx": "2.1.1",

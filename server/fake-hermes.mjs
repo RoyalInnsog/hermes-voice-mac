@@ -1,15 +1,8 @@
 #!/usr/bin/env node
-// server/fake-hermes.mjs — a test double for the Hermes CLI.
-//
-// Why this exists: the installed `hermes` almost certainly does NOT emit the
-// HV_* markers yet (LIMITATIONS L-2). This double implements the exact contract
-// the real bridge expects, so the entire loop — spawn → stream → permission
-// pause → stdin decision → resume → completion — is verifiable today, on any
-// machine, without touching your real Hermes or Omniroute.
+// server/fake-hermes.mjs — deterministic Hermes CLI simulator & contract verifier.
+// Supports both `--format stream-json` (Hermes v1.0 wire protocol) and legacy `HV_*` markers.
 //
 //   HV_HERMES_CMD="node server/fake-hermes.mjs" node server/index.mjs
-//
-// It is explicitly a simulator: no LLM call, no file mutation, no network.
 
 import { classifyRisk } from "./risk.mjs";
 
@@ -18,11 +11,15 @@ const qIdx = args.indexOf("-q");
 const utterance = qIdx >= 0 ? args[qIdx + 1] ?? "" : "";
 const sIdx = args.indexOf("--session");
 const sessionId = sIdx >= 0 ? args[sIdx + 1] ?? "" : "";
+const fIdx = args.indexOf("--format");
+const format = fIdx >= 0 ? args[fIdx + 1] ?? "" : "";
+const isStreamJson = format === "stream-json";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const out = (line) => process.stdout.write(line + "\n");
 const event = (kind, payload = {}) => out(`HV_EVENT: ${JSON.stringify({ kind, ...payload })}`);
-const progress = (text) => out(`HV_PROGRESS: ${text}`);
+const progress = (text) =>
+  isStreamJson ? out(JSON.stringify({ type: "text", text })) : out(`HV_PROGRESS: ${text}`);
 
 /* --------------------------- stdin decision pump -------------------------- */
 
@@ -70,7 +67,8 @@ const SCENARIOS = [
       { progress: "Combos read-only padh raha hoon" },
       { perm: { tool: "read_file", args: { path: "~/.9router/db/data.sqlite", mode: "read-only" } } },
     ],
-    summary: "Omniroute healthy hai, latency 42ms. 4 combos loaded (read-only): KRITI(5), FALLBACK-FREE(3), VISION(2), LONGCTX(4). Kuch edit nahi kiya.",
+    summary:
+      "Omniroute healthy hai, latency 42ms. 4 combos loaded (read-only): KRITI(5), FALLBACK-FREE(3), VISION(2), LONGCTX(4). Kuch edit nahi kiya.",
   },
   {
     match: /commit|git|push|repo/i,
@@ -84,7 +82,14 @@ const SCENARIOS = [
   },
   {
     match: /key|secret|credential|token|password/i,
-    steps: [{ perm: { tool: "read_credentials", args: { store: "Keychain", item: "gemini_api_key", api_key: "AIzaSyDEMO1234567890abcdef" } } }],
+    steps: [
+      {
+        perm: {
+          tool: "read_credentials",
+          args: { store: "Keychain", item: "gemini_api_key", api_key: "AIzaSyDEMO1234567890abcdef" },
+        },
+      },
+    ],
     summary: "Credential request bana tha. Value kabhi plaintext me nahi dikhti — sirf [REDACTED].",
   },
   {
@@ -116,7 +121,8 @@ const DEFAULT = {
     { progress: "Memory context load ho gaya" },
     { perm: { tool: "search", args: { query: utterance.slice(0, 40) || "latest notes" } } },
   ],
-  summary: "Kaam ho gaya. Memory se context load kiya, plan banaya, execute kiya. Poora transcript session me save hai.",
+  summary:
+    "Kaam ho gaya. Memory se context load kiya, plan banaya, execute kiya. Poora transcript session me save hai.",
 };
 
 const scenario = SCENARIOS.find((s) => s.match.test(utterance)) ?? DEFAULT;
@@ -124,9 +130,29 @@ const scenario = SCENARIOS.find((s) => s.match.test(utterance)) ?? DEFAULT;
 /* --------------------------------- run ----------------------------------- */
 
 async function main() {
-  progress(`fake-hermes online — session ${sessionId || "(none)"}, utterance "${utterance.slice(0, 60)}"`);
-  event("thinking");
-  await sleep(250);
+  if (args.includes("--version") || args.includes("-v")) {
+    out("hermes-agent 1.0.0 (Nous Research / OmniRoute local bridge)");
+    process.exit(0);
+  }
+  if (args.includes("--help") || args.includes("-h")) {
+    out("Usage: hermes chat -q <query> [--format stream-json] [--session <id>]");
+    process.exit(0);
+  }
+
+  if (isStreamJson) {
+    out(
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        model: "KRITI / 9Router",
+        session_id: sessionId || "default-session",
+      }),
+    );
+  } else {
+    progress(`fake-hermes online — session ${sessionId || "(none)"}, utterance "${utterance.slice(0, 60)}"`);
+    event("thinking");
+  }
+  await sleep(180);
 
   const denied = [];
   let seq = 0;
@@ -135,40 +161,64 @@ async function main() {
     if (step.sleep) await sleep(step.sleep);
     if (step.progress) {
       progress(step.progress);
-      await sleep(300);
+      await sleep(220);
     }
     if (step.perm) {
       const id = `perm-${++seq}`;
       const { risk, note } = classifyRisk(step.perm.tool, step.perm.args);
-      out(`HV_PERM: ${JSON.stringify({ id, tool: step.perm.tool, args: step.perm.args, reason: step.perm.reason ?? note, risk })}`);
+      out(
+        `HV_PERM: ${JSON.stringify({
+          id,
+          tool: step.perm.tool,
+          args: step.perm.args,
+          reason: step.perm.reason ?? note,
+          risk,
+        })}`,
+      );
       const decision = await awaitDecision(id);
       if (decision === "deny" || decision === "timeout-no-answer") {
         denied.push(step.perm.tool);
         progress(`${step.perm.tool} skip kiya (${decision})`);
-        await sleep(150);
+        await sleep(120);
         continue;
       }
-      event("toolCall", { name: step.perm.tool, args: step.perm.args });
-      await sleep(350);
+      if (isStreamJson && risk === "low") {
+        out(JSON.stringify({ type: "tool_call", id, name: step.perm.tool, arguments: step.perm.args }));
+      } else {
+        event("toolCall", { name: step.perm.tool, args: step.perm.args });
+      }
+      await sleep(250);
     }
     if (step.tool) {
-      event("toolCall", { name: step.tool, args: step.args ?? {} });
-      await sleep(350);
+      if (isStreamJson) {
+        out(JSON.stringify({ type: "tool_call", name: step.tool, arguments: step.args ?? {} }));
+      } else {
+        event("toolCall", { name: step.tool, args: step.args ?? {} });
+      }
+      await sleep(250);
     }
   }
 
   if (scenario.fail) {
-    event("failed", { reason: scenario.fail });
+    if (isStreamJson) {
+      out(JSON.stringify({ type: "result", text: scenario.fail, error: scenario.fail, exit_code: 2 }));
+    } else {
+      event("failed", { reason: scenario.fail });
+    }
     process.exit(2);
   }
 
   const suffix = denied.length ? ` Denied tools skip kiye: ${denied.join(", ")}.` : "";
-  event("completed", { text: scenario.summary + suffix });
+  const finalText = scenario.summary + suffix;
+  if (isStreamJson) {
+    out(JSON.stringify({ type: "result", text: finalText, exit_code: 0 }));
+  } else {
+    event("completed", { text: finalText });
+  }
   process.exit(0);
 }
 
 if (!utterance && args.length === 0) {
-  // Interactive smoke mode: `node server/fake-hermes.mjs` then type text on stdin.
   out("fake-hermes: pass `-q \"text\"` (or HV_HERMES_CMD='node server/fake-hermes.mjs')");
   process.exit(0);
 }

@@ -1,5 +1,5 @@
-// Hermes Voice — core data models.
-// Mirrors Section 7 of the master spec (Swift structs -> TS types).
+// Hermes Voice v1.0 — core data models.
+// Mirrors Section 7 of the master spec.
 
 export type Role = "user" | "assistant" | "system";
 
@@ -36,9 +36,10 @@ export interface PermissionRequest {
 
 export type AgentEvent =
   | { kind: "thinking"; taskID: string }
+  | { kind: "status"; taskID: string; subtype: string; model: string | null; sessionId: string | null }
   | { kind: "toolCall"; taskID: string; name: string; args: Record<string, string> }
   | { kind: "permissionRequest"; taskID: string; request: PermissionRequest }
-  | { kind: "progress"; taskID: string; text: string }
+  | { kind: "progress"; taskID: string; text: string; streamChunk?: boolean }
   | { kind: "completed"; taskID: string; text: string }
   | { kind: "failed"; taskID: string; reason: string }
   | { kind: "cancelled"; taskID: string };
@@ -128,7 +129,7 @@ export const DEFAULT_SETTINGS: Settings = {
   lang: "hinglish",
   sttLocale: "en-IN",
   onDeviceSTT: true,
-  ttsEngine: "webSpeech",
+  ttsEngine: "edgeTTS",
   ttsVoiceURI: null,
   ttsRate: 1,
   ttsPitch: 1,
@@ -138,7 +139,7 @@ export const DEFAULT_SETTINGS: Settings = {
   bridgeMode: "local",
   bridgeURL: "http://127.0.0.1:20130",
   useBridgeTTS: true,
-  hermesPath: "/opt/homebrew/bin/hermes",
+  hermesPath: "/Users/apple/.hermes/hermes-agent/.hermes/bin/hermes",
   hermesWorkingDir: "~/.hermes",
   hermesTimeoutSec: 300,
   httpBridgeBaseURL: "http://127.0.0.1:8080",

@@ -1,4 +1,4 @@
-// The Voice Orchestrator — spec §4.1 / §8.x, wired to the UI and to the real local bridge.
+// The Voice Orchestrator — spec §4.1 / §8.x / §2.4, wired to the UI and to the real local bridge.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { attempt, type StateName } from "../lib/stateMachine";
@@ -9,7 +9,16 @@ import { makeBridge, type AgentBridge } from "../lib/agentBridge";
 import { BridgeClient, LocalBridge, type BridgeServerHealth, type ServerTestResult } from "../lib/localBridge";
 import { OmnirouteClient, type ProbeResult } from "../lib/omniroute";
 import { mapVoiceDecision, speechify, summarizeForSpeech, WebSTTEngine, WebTTSEngine } from "../lib/speech";
-import { appendAudit, clearAudit, deleteSessions, loadAudit, loadSessions, loadSettings, saveSession, saveSettings } from "../lib/store";
+import {
+  appendAudit,
+  clearAudit,
+  deleteSessions,
+  loadAudit,
+  loadSessions,
+  loadSettings,
+  saveSession,
+  saveSettings,
+} from "../lib/store";
 import { errText, type ErrorCode } from "../lib/errors";
 import { confirmTranscriptPrompt, permissionAskPrompt, t } from "../lib/strings";
 import {
@@ -87,10 +96,14 @@ export function useHermesVoice() {
   const [pendingRemaining, setPendingRemaining] = useState(0);
   const [pendingConfirm, setPendingConfirm] = useState<{ text: string; confidence: number } | null>(null);
   const [lastAssistant, setLastAssistant] = useState("");
+  const [activeModel, setActiveModel] = useState("KRITI / 9Router");
   const [activeError, setActiveError] = useState<ActiveError | null>(null);
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [combos, setCombos] = useState<{ combos: ComboInfo[]; pathUsed: string | null }>({ combos: [], pathUsed: null });
+  const [combos, setCombos] = useState<{ combos: ComboInfo[]; pathUsed: string | null }>({
+    combos: [],
+    pathUsed: null,
+  });
   const [probe, setProbe] = useState<ProbeResult | null>(null);
   const [sessions, setSessions] = useState<Session[]>(() => loadSessions());
   const [audit, setAudit] = useState<AuditEntry[]>(() => loadAudit());
@@ -105,9 +118,12 @@ export function useHermesVoice() {
   const stt = useRef<WebSTTEngine | null>(null);
   const tts = useRef<WebTTSEngine | null>(null);
   const audioEl = useRef<HTMLAudioElement | null>(null);
+  const playbackMeterTimer = useRef<number | null>(null);
   const bridgeRef = useRef<AgentBridge | null>(null);
   const clientRef = useRef<BridgeClient>(new BridgeClient(settings.bridgeURL));
-  const mockBridge = useRef<AgentBridge>(makeBridge("mock", { hermesPath: "", workingDir: "", timeoutSec: 0, httpBaseURL: "" }));
+  const mockBridge = useRef<AgentBridge>(
+    makeBridge("mock", { hermesPath: "", workingDir: "", timeoutSec: 0, httpBaseURL: "" }),
+  );
   const approvalResolver = useRef<((o: ApprovalOutcome) => void) | null>(null);
   const permTimer = useRef<number | null>(null);
   const cancelFlag = useRef(false);
@@ -138,37 +154,83 @@ export function useHermesVoice() {
     return true;
   }, []);
 
+  const stopPlaybackMeter = useCallback(() => {
+    if (playbackMeterTimer.current !== null) {
+      window.clearInterval(playbackMeterTimer.current);
+      playbackMeterTimer.current = null;
+    }
+    if (stateRef.current !== "listening") setLevel(0);
+  }, []);
+
+  const startPlaybackMeter = useCallback(() => {
+    stopPlaybackMeter();
+    let phase = 0;
+    playbackMeterTimer.current = window.setInterval(() => {
+      phase += 0.38;
+      const synthLevel = 0.08 + Math.abs(Math.sin(phase) * 0.14) + Math.abs(Math.cos(phase * 1.7) * 0.08);
+      setLevel(synthLevel);
+    }, 55);
+  }, [stopPlaybackMeter]);
+
+  /** Barge-in helper: immediately halt any ongoing TTS playback (spec §2.4). */
+  const haltAudio = useCallback(() => {
+    if (audioEl.current) {
+      try {
+        audioEl.current.pause();
+        audioEl.current.currentTime = 0;
+      } catch {
+        /* ignore */
+      }
+    }
+    tts.current?.stop();
+    stopPlaybackMeter();
+    setSpeakingNow(false);
+  }, [stopPlaybackMeter]);
+
   /** Speak via the bridge's Edge TTS when available; otherwise the system voice. */
-  const playBridgeAudio = useCallback(async (text: string): Promise<boolean> => {
-    const s = settingsRef.current;
-    if (!s.useBridgeTTS || !backend.reachable) return false;
-    try {
-      const res = await clientRef.current.tts(text, s.ttsEngine === "edgeTTS" ? undefined : undefined);
-      if (!res.ok) {
-        logger.warn("tts", `bridge tts refused: ${res.message ?? res.error} (${res.hint ?? "no hint"})`);
+  const playBridgeAudio = useCallback(
+    async (text: string): Promise<boolean> => {
+      const s = settingsRef.current;
+      if (!s.useBridgeTTS || !backend.reachable) return false;
+      try {
+        const preferredVoice = s.lang === "english" ? "en-IN-NeerjaNeural" : "hi-IN-MadhurNeural";
+        const res = await clientRef.current.tts(text, preferredVoice);
+        if (!res.ok) {
+          logger.warn("tts", `bridge tts refused: ${res.message ?? res.error} (${res.hint ?? "no hint"})`);
+          return false;
+        }
+        const url = clientRef.current.resolveUrl(res.url);
+        const el = audioEl.current ?? new Audio();
+        audioEl.current = el;
+        el.pause();
+        el.currentTime = 0;
+        el.src = url;
+        el.volume = s.ttsVolume;
+        setSpeakingNow(true);
+        startPlaybackMeter();
+        await el.play();
+        await new Promise<void>((r) => {
+          const done = () => {
+            stopPlaybackMeter();
+            r();
+          };
+          el.onended = done;
+          el.onerror = done;
+          el.onpause = done;
+          setTimeout(done, 45000);
+        });
+        setSpeakingNow(false);
+        logger.info("tts", `played ${res.bytes}B from bridge engine=${res.engine} in ${res.ms}ms`);
+        return true;
+      } catch (e) {
+        stopPlaybackMeter();
+        setSpeakingNow(false);
+        logger.warn("tts", `bridge audio playback failed: ${e instanceof Error ? e.message : String(e)}`);
         return false;
       }
-      const url = s.bridgeURL.replace(/\/+$/, "") + res.url;
-      const el = audioEl.current ?? new Audio();
-      audioEl.current = el;
-      el.src = url;
-      el.volume = s.ttsVolume;
-      setSpeakingNow(true);
-      await el.play();
-      await new Promise<void>((r) => {
-        el.onended = () => r();
-        el.onerror = () => r();
-        setTimeout(r, 45000);
-      });
-      setSpeakingNow(false);
-      logger.info("tts", `played ${res.bytes}B from bridge engine=${res.engine} in ${res.ms}ms`);
-      return true;
-    } catch (e) {
-      setSpeakingNow(false);
-      logger.warn("tts", `bridge audio playback failed: ${e instanceof Error ? e.message : String(e)}`);
-      return false;
-    }
-  }, [backend.reachable]);
+    },
+    [backend.reachable, startPlaybackMeter, stopPlaybackMeter],
+  );
 
   const speak = useCallback(
     async (text: string, priority: "low" | "normal" | "high" = "normal") => {
@@ -178,10 +240,13 @@ export function useHermesVoice() {
       if (s.ttsEngine !== "webSpeech" || s.useBridgeTTS) {
         const spoken = s.ttsEngine === "webSpeech" ? text : summarizeForSpeech(text);
         if (await playBridgeAudio(speechify(spoken))) return;
-        if (s.ttsEngine !== "webSpeech") logger.warn("tts", `engine "${s.ttsEngine}" unavailable → falling back to system voice`);
+        if (s.ttsEngine !== "webSpeech") {
+          logger.warn("tts", `engine "${s.ttsEngine}" unavailable → falling back to system voice`);
+        }
       }
       if (!tts.current) return;
       setSpeakingNow(true);
+      startPlaybackMeter();
       await tts.current.speak(speechify(text), {
         priority,
         lang: s.sttLocale,
@@ -190,9 +255,10 @@ export function useHermesVoice() {
         volume: s.ttsVolume,
         voiceURI: s.ttsVoiceURI,
       });
+      stopPlaybackMeter();
       setSpeakingNow(false);
     },
-    [playBridgeAudio],
+    [playBridgeAudio, startPlaybackMeter, stopPlaybackMeter],
   );
 
   const raise = useCallback(
@@ -210,7 +276,14 @@ export function useHermesVoice() {
 
   const ensureSession = useCallback((): Session => {
     if (sessionRef.current) return sessionRef.current;
-    const s: Session = { schemaVersion: 1, id: uid(), startedAt: Date.now(), endedAt: null, status: "active", utterances: [] };
+    const s: Session = {
+      schemaVersion: 1,
+      id: uid(),
+      startedAt: Date.now(),
+      endedAt: null,
+      status: "active",
+      utterances: [],
+    };
     sessionRef.current = s;
     return s;
   }, []);
@@ -238,20 +311,23 @@ export function useHermesVoice() {
 
   /* ------------------------------ permission ----------------------------- */
 
-  const logAudit = useCallback((req: PermissionRequest, decision: AuditEntry["decision"], via: AuditEntry["via"]) => {
-    const entry: AuditEntry = {
-      id: uid(),
-      at: Date.now(),
-      toolName: req.toolName,
-      risk: req.risk,
-      decision,
-      argsRedacted: formatArgs(redactArgs(req.args)),
-      via,
-    };
-    appendAudit(entry);
-    setAudit(loadAudit());
-    logger.info("permissions", `${req.toolName} [${req.risk}] → ${decision} (via ${via}) ${entry.argsRedacted}`);
-  }, []);
+  const logAudit = useCallback(
+    (req: PermissionRequest, decision: AuditEntry["decision"], via: AuditEntry["via"]) => {
+      const entry: AuditEntry = {
+        id: uid(),
+        at: Date.now(),
+        toolName: req.toolName,
+        risk: req.risk,
+        decision,
+        argsRedacted: formatArgs(redactArgs(req.args)),
+        via,
+      };
+      appendAudit(entry);
+      setAudit(loadAudit());
+      logger.info("permissions", `${req.toolName} [${req.risk}] → ${decision} (via ${via}) ${entry.argsRedacted}`);
+    },
+    [],
+  );
 
   const clearPermTimer = () => {
     if (permTimer.current) {
@@ -265,18 +341,34 @@ export function useHermesVoice() {
       const req = pending;
       if (!req || !approvalResolver.current) return;
       clearPermTimer();
-      logAudit(req, via === "click" && decision === "deny" && typedConfirm === "__timeout" ? "timeout-deny" : decision, via);
+      stt.current?.abort();
+      logAudit(
+        req,
+        via === "click" && decision === "deny" && typedConfirm === "__timeout" ? "timeout-deny" : decision,
+        via,
+      );
       if (decision === "allowSession") {
-        allowlistRef.current = allowlistRef.current.includes(req.toolName) ? allowlistRef.current : [...allowlistRef.current, req.toolName];
+        allowlistRef.current = allowlistRef.current.includes(req.toolName)
+          ? allowlistRef.current
+          : [...allowlistRef.current, req.toolName];
         setSessionAllowlist(allowlistRef.current);
       }
-      push({ kind: "permission", text: `${req.toolName} → ${decision.toUpperCase()}`, meta: `${req.risk} · via ${via}` });
+      push({
+        kind: "permission",
+        text: `${req.toolName} → ${decision.toUpperCase()}`,
+        meta: `${req.risk} · via ${via}`,
+      });
       const resolver = approvalResolver.current;
       approvalResolver.current = null;
       setPending(null);
       setPendingRemaining(0);
       setState("thinking", "permission resolved");
-      void speak(decision === "deny" ? t("permissionDenied", settingsRef.current.lang) : t("permissionGranted", settingsRef.current.lang), decision === "deny" ? "high" : "low");
+      void speak(
+        decision === "deny"
+          ? t("permissionDenied", settingsRef.current.lang)
+          : t("permissionGranted", settingsRef.current.lang),
+        decision === "deny" ? "high" : "low",
+      );
       resolver({ decision, via, typedConfirm });
     },
     [pending, logAudit, push, setState, speak],
@@ -286,6 +378,7 @@ export function useHermesVoice() {
     const req = pending;
     if (!req || !approvalResolver.current) return;
     clearPermTimer();
+    stt.current?.abort();
     logAudit(req, "timeout-deny", "timeout");
     push({ kind: "permission", text: `${req.toolName} → TIMEOUT-DENY`, meta: "auto-deny" });
     const resolver = approvalResolver.current;
@@ -295,6 +388,59 @@ export function useHermesVoice() {
     void speak(t("permissionTimeout", settingsRef.current.lang), "high");
     resolver({ decision: "deny", via: "click" });
   }, [pending, logAudit, push, setState, speak]);
+
+  /* ----------------------------- voice approval -------------------------- */
+
+  const voiceDecide = useCallback(
+    (spoken: string) => {
+      if (!pending || !settingsRef.current.voiceApproval) return false;
+      if (!allowsVoiceApproval(pending.risk)) {
+        push({
+          kind: "system",
+          text: `Voice approval ${pending.risk} risk pe blocked hai — click/type karo.`,
+        });
+        return false;
+      }
+      const d = mapVoiceDecision(spoken);
+      if (!d) return false;
+      resolvePermission(d === "allow" ? "allowOnce" : "deny", "voice");
+      return true;
+    },
+    [pending, push, resolvePermission],
+  );
+
+  const listenForApproval = useCallback(async () => {
+    if (!pending || !stt.current) return;
+    if (!settingsRef.current.voiceApproval || !allowsVoiceApproval(pending.risk)) {
+      push({ kind: "system", text: `Voice approval ${pending.risk} risk pe blocked hai.` });
+      return;
+    }
+    haltAudio();
+    await stt.current.start(settingsRef.current.sttLocale, {
+      onPartial: (txt) => {
+        setPartial(txt);
+        // Immediate recognition if user clearly says haan/allow/nahi/deny
+        const d = mapVoiceDecision(txt);
+        if (d && txt.trim().split(/\s+/).length >= 1) {
+          stt.current?.stop();
+        }
+      },
+      onLevel: setLevel,
+      onFinal: (txt) => {
+        setPartial("");
+        setLevel(0);
+        if (!txt.trim()) return;
+        logger.info("permissions", `voice reply: "${txt}"`);
+        if (!voiceDecide(txt)) {
+          push({
+            kind: "system",
+            text: `Clear nahi tha: "${txt}" — haan/allow ya nahi/deny bolo.`,
+          });
+        }
+      },
+      onError: (code, detail) => logger.error("stt", `approval listen ${code}: ${detail}`),
+    });
+  }, [haltAudio, pending, push, voiceDecide]);
 
   const requestApproval = useCallback(
     (req: PermissionRequest): Promise<ApprovalOutcome> => {
@@ -311,11 +457,18 @@ export function useHermesVoice() {
       }
 
       const timeoutSec = s.permissionTimeoutSec;
-      const withExpiry: PermissionRequest = { ...req, expiresAt: req.expiresAt || Date.now() + timeoutSec * 1000 };
+      const withExpiry: PermissionRequest = {
+        ...req,
+        expiresAt: req.expiresAt || Date.now() + timeoutSec * 1000,
+      };
       setPending(withExpiry);
       setPendingRemaining(Math.max(0, Math.ceil((withExpiry.expiresAt - Date.now()) / 1000)));
       setState("awaitingPermission", "bridge requested approval");
-      push({ kind: "permission", text: `Permission chahiye: ${req.toolName}`, meta: `${req.risk} · ${formatArgs(redactArgs(req.args))}` });
+      push({
+        kind: "permission",
+        text: `Permission chahiye: ${req.toolName}`,
+        meta: `${req.risk} · ${formatArgs(redactArgs(req.args))}`,
+      });
       void speak(permissionAskPrompt(req.toolName, req.risk, s.lang), "high");
 
       clearPermTimer();
@@ -345,6 +498,10 @@ export function useHermesVoice() {
         case "thinking":
           setState("thinking", "agent thinking");
           break;
+        case "status":
+          if (e.model) setActiveModel(e.model);
+          logger.info("agent", `stream-json init: model=${e.model ?? "default"} session=${e.sessionId ?? "—"}`);
+          break;
         case "toolCall":
           push({ kind: "tool", text: e.name, meta: formatArgs(redactArgs(e.args)) });
           logger.info("agent", `toolCall ${e.name} ${formatArgs(redactArgs(e.args))}`);
@@ -356,7 +513,14 @@ export function useHermesVoice() {
         case "completed": {
           setLastAssistant(e.text);
           push({ kind: "assistant", text: e.text });
-          appendUtterance({ id: uid(), timestamp: Date.now(), role: "assistant", text: e.text, audioDuration: null, confidence: null });
+          appendUtterance({
+            id: uid(),
+            timestamp: Date.now(),
+            role: "assistant",
+            text: e.text,
+            audioDuration: null,
+            confidence: null,
+          });
           setState("speaking", "task completed");
           void speak(`${t("taskDone", s.lang)} ${summarizeForSpeech(e.text)}`, "normal").then(() => {
             setState("idle", "report delivered");
@@ -385,15 +549,17 @@ export function useHermesVoice() {
       const configured = bridgeRef.current;
       if (!configured) return;
 
-      // Honest degradation: with the local bridge offline the flows are still
-      // demonstrable against the simulator, but it is announced — never silently.
       let bridge = configured;
       const avail = configured.available();
       if (!avail.ok) {
         if (s.bridgeMode === "local") {
           bridge = mockBridge.current;
           logger.warn("agent", `local bridge offline → simulator mode. ${avail.reason}`);
-          push({ kind: "system", text: "Local bridge offline — simulator mode me chala raha hoon (real hermes spawn nahi hoga).", meta: avail.reason });
+          push({
+            kind: "system",
+            text: "Local bridge offline — simulator mode me chala raha hoon (real hermes spawn nahi hoga).",
+            meta: avail.reason,
+          });
         } else {
           raise("bridgeNotImplemented", avail.reason);
           setState("idle", "bridge unavailable");
@@ -402,8 +568,19 @@ export function useHermesVoice() {
       }
 
       const session = ensureSession();
-      appendUtterance({ id: uid(), timestamp: Date.now(), role: "user", text, audioDuration: durationMs ? durationMs / 1000 : null, confidence });
-      push({ kind: "user", text, meta: confidence !== null ? `confidence ${(confidence * 100).toFixed(0)}%` : "typed" });
+      appendUtterance({
+        id: uid(),
+        timestamp: Date.now(),
+        role: "user",
+        text,
+        audioDuration: durationMs ? durationMs / 1000 : null,
+        confidence,
+      });
+      push({
+        kind: "user",
+        text,
+        meta: confidence !== null ? `confidence ${(confidence * 100).toFixed(0)}%` : "typed",
+      });
 
       const taskID = uid();
       currentTask.current = taskID;
@@ -484,18 +661,24 @@ export function useHermesVoice() {
 
   const startListening = useCallback(async () => {
     const s = settingsRef.current;
+    // Barge-in: immediately interrupt any playing TTS audio when the user taps the mic or speaks
+    haltAudio();
+
+    // If a permission modal is active and allows voice approval, route the mic directly to permission confirmation!
+    if (stateRef.current === "awaitingPermission" && pending) {
+      await listenForApproval();
+      return;
+    }
+
     if (stateRef.current === "listening") return;
     if (!sttSupported) {
       raise("sttUnsupported");
       return;
     }
-    if (!setState("listening", "hotkey down")) return;
+    if (!setState("listening", "mic / hotkey barge-in")) return;
     setActiveError(null);
     setPartial("");
     listenStart.current = Date.now();
-    tts.current?.stop();
-    audioEl.current?.pause();
-    setSpeakingNow(false);
 
     if (maxLenTimer.current) window.clearTimeout(maxLenTimer.current);
     maxLenTimer.current = window.setTimeout(() => {
@@ -518,9 +701,13 @@ export function useHermesVoice() {
         setState("idle", "stt error");
       },
     });
-  }, [finalizeTranscript, push, raise, setState, speak, sttSupported]);
+  }, [finalizeTranscript, haltAudio, listenForApproval, pending, push, raise, setState, speak, sttSupported]);
 
   const stopListening = useCallback(() => {
+    if (stateRef.current === "awaitingPermission") {
+      stt.current?.stop();
+      return;
+    }
     if (stateRef.current !== "listening") return;
     if (maxLenTimer.current) window.clearTimeout(maxLenTimer.current);
     stt.current?.stop();
@@ -532,6 +719,7 @@ export function useHermesVoice() {
     const s = settingsRef.current;
     const st = stateRef.current;
     cancelFlag.current = true;
+    haltAudio();
     if (currentTask.current && backend.reachable) {
       void clientRef.current.cancelTask(currentTask.current).catch(() => {});
     }
@@ -557,9 +745,6 @@ export function useHermesVoice() {
       return;
     }
     if (st === "speaking") {
-      tts.current?.stop();
-      audioEl.current?.pause();
-      setSpeakingNow(false);
       setState("idle", "tts stopped");
       return;
     }
@@ -567,45 +752,7 @@ export function useHermesVoice() {
       setPendingConfirm(null);
       setState("idle", "confirm cancelled");
     }
-  }, [backend.reachable, push, resolvePermission, setState, speak]);
-
-  /* ----------------------------- voice approval -------------------------- */
-
-  const voiceDecide = useCallback(
-    (spoken: string) => {
-      if (!pending || !settingsRef.current.voiceApproval) return false;
-      if (!allowsVoiceApproval(pending.risk)) {
-        push({ kind: "system", text: `Voice approval ${pending.risk} risk pe blocked hai — click karo.` });
-        return false;
-      }
-      const d = mapVoiceDecision(spoken);
-      if (!d) return false;
-      resolvePermission(d === "allow" ? "allowOnce" : "deny", "voice");
-      return true;
-    },
-    [pending, push, resolvePermission],
-  );
-
-  const listenForApproval = useCallback(async () => {
-    if (!pending || !stt.current) return;
-    if (!settingsRef.current.voiceApproval || !allowsVoiceApproval(pending.risk)) {
-      push({ kind: "system", text: `Voice approval ${pending.risk} risk pe blocked hai.` });
-      return;
-    }
-    tts.current?.stop();
-    await stt.current.start(settingsRef.current.sttLocale, {
-      onPartial: setPartial,
-      onLevel: setLevel,
-      onFinal: (txt) => {
-        setPartial("");
-        setLevel(0);
-        if (!txt.trim()) return;
-        logger.info("permissions", `voice reply: "${txt}"`);
-        if (!voiceDecide(txt)) push({ kind: "system", text: `Clear nahi tha: "${txt}" — haan/allow ya nahi/deny bolo.` });
-      },
-      onError: (code, detail) => logger.error("stt", `approval listen ${code}: ${detail}`),
-    });
-  }, [pending, push, voiceDecide]);
+  }, [backend.reachable, haltAudio, push, resolvePermission, setState, speak]);
 
   /* ------------------------------ confirm flow --------------------------- */
 
@@ -627,13 +774,17 @@ export function useHermesVoice() {
   const submitText = useCallback(
     (text: string) => {
       if (!text.trim()) return;
+      if (stateRef.current === "speaking") {
+        haltAudio();
+        setState("idle", "barge-in via text");
+      }
       if (stateRef.current !== "idle" && stateRef.current !== "degraded") {
         logger.warn("app", `submitText ignored in state ${stateRef.current}`);
         return;
       }
       void runAgent(text.trim(), null, null);
     },
-    [runAgent],
+    [haltAudio, runAgent, setState],
   );
 
   const repeatLast = useCallback(() => {
@@ -648,13 +799,23 @@ export function useHermesVoice() {
     clientRef.current = new BridgeClient(s.bridgeURL);
     try {
       const h = await clientRef.current.health();
-      setBackend((b) => ({ ...b, health: h, reachable: true, lastChecked: Date.now(), reason: `bridge v${h.version} · pid ${h.pid}` }));
+      setBackend((b) => ({
+        ...b,
+        health: h,
+        reachable: true,
+        lastChecked: Date.now(),
+        reason: `bridge v${h.version} · pid ${h.pid}`,
+      }));
+      if (h.tasks?.activeModel) setActiveModel(h.tasks.activeModel);
+      else if (h.omniroute?.activeCombo) setActiveModel(h.omniroute.activeCombo);
       setHealth({
         reachable: h.omniroute.reachable,
         latencyMs: h.omniroute.latencyMs,
         version: h.omniroute.version,
         checkedAt: h.omniroute.checkedAt,
-        detail: h.omniroute.reachable ? `${h.omniroute.path} → ${h.omniroute.status}` : "unreachable from bridge host",
+        detail: h.omniroute.reachable
+          ? `${h.omniroute.path} → ${h.omniroute.status}`
+          : "unreachable from bridge host",
       });
       if (!h.hermes.found) logger.warn("agent", `hermes binary not found: ${h.hermes.detail}`);
       return h;
@@ -692,10 +853,19 @@ export function useHermesVoice() {
     logger.info("router", `probe ${s.probeModel} (stream:false)`);
     if (backend.reachable) {
       const r = await clientRef.current.routerProbe(s.probeModel);
-      const res: ProbeResult = { ok: r.ok, latencyMs: r.latencyMs, model: r.model, sample: r.sample ?? "", error: r.error };
+      const res: ProbeResult = {
+        ok: r.ok,
+        latencyMs: r.latencyMs,
+        model: r.model,
+        sample: r.sample ?? "",
+        error: r.error,
+      };
       setProbe(res);
       try {
-        const [m, c] = await Promise.all([clientRef.current.routerModels(), clientRef.current.routerCombos()]);
+        const [m, c] = await Promise.all([
+          clientRef.current.routerModels(),
+          clientRef.current.routerCombos(),
+        ]);
         setModels(m.models);
         setCombos({ combos: c.combos, pathUsed: c.pathUsed });
       } catch (e) {
@@ -758,7 +928,13 @@ export function useHermesVoice() {
       setBackend((b) => ({ ...b, memoryText: { path: f.path, text: f.text } }));
     } catch (e) {
       const err = e as Error;
-      setBackend((b) => ({ ...b, memoryText: { path, text: `Read failed: ${err.message}\n(~/.hermes/memories read-only hai; file is host pe maujood honi chahiye.)` } }));
+      setBackend((b) => ({
+        ...b,
+        memoryText: {
+          path,
+          text: `Read failed: ${err.message}\n(~/.hermes/memories read-only hai; file is host pe maujood honi chahiye.)`,
+        },
+      }));
     }
   }, []);
 
@@ -768,7 +944,7 @@ export function useHermesVoice() {
     stt.current = new WebSTTEngine();
     tts.current = new WebTTSEngine();
     const unsub = logger.subscribe(() => setLogs([...logger.lines()]));
-    logger.info("app", "Hermes Voice starting — voice shell for the Hermes Agent");
+    logger.info("app", "Hermes Voice v1.0 starting — voice shell for the Hermes Agent");
 
     const loadVoices = () => setVoices(WebTTSEngine.supported() ? window.speechSynthesis.getVoices() : []);
     loadVoices();
@@ -790,8 +966,7 @@ export function useHermesVoice() {
     return () => {
       unsub();
       stt.current?.abort();
-      tts.current?.stop();
-      audioEl.current?.pause();
+      haltAudio();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -806,7 +981,10 @@ export function useHermesVoice() {
       lb.setStatus(
         backend.reachable
           ? { ok: true }
-          : { ok: false, reason: `Local bridge ${settings.bridgeURL} pe nahi mila (${backend.reason}). Chalao: node server/index.mjs` },
+          : {
+              ok: false,
+              reason: `Local bridge ${settings.bridgeURL} pe nahi mila (${backend.reason}). Chalao: node server/index.mjs`,
+            },
       );
       next = lb;
     } else {
@@ -819,7 +997,16 @@ export function useHermesVoice() {
     }
     bridgeRef.current = next;
     logger.info("agent", `bridge = ${next.label} (${next.available().ok ? "available" : "unavailable"})`);
-  }, [backend.reachable, backend.reason, settings.bridgeMode, settings.bridgeURL, settings.hermesPath, settings.hermesWorkingDir, settings.hermesTimeoutSec, settings.httpBridgeBaseURL]);
+  }, [
+    backend.reachable,
+    backend.reason,
+    settings.bridgeMode,
+    settings.bridgeURL,
+    settings.hermesPath,
+    settings.hermesWorkingDir,
+    settings.hermesTimeoutSec,
+    settings.httpBridgeBaseURL,
+  ]);
 
   // Backend health polling.
   useEffect(() => {
@@ -846,7 +1033,8 @@ export function useHermesVoice() {
 
   const pttDown = useRef(false);
   useEffect(() => {
-    const typing = (target: HTMLElement | null) => Boolean(target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable));
+    const typing = (target: HTMLElement | null) =>
+      Boolean(target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable));
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.altKey && e.metaKey && e.code === "Space") {
         e.preventDefault();
@@ -908,6 +1096,7 @@ export function useHermesVoice() {
     pendingRemaining,
     pendingConfirm,
     lastAssistant,
+    activeModel,
     activeError,
     health,
     models,
@@ -929,6 +1118,7 @@ export function useHermesVoice() {
     bridgeId: bridgeRef.current?.id ?? "mock",
     startListening,
     stopListening,
+    haltAudio,
     cancel,
     submitText,
     repeatLast,

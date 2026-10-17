@@ -1,7 +1,19 @@
 import type { ReactNode } from "react";
 import { cn } from "../utils/cn";
 
-export function Panel({ className, children, title, hint, action }: { className?: string; children: ReactNode; title?: string; hint?: string; action?: ReactNode }) {
+export function Panel({
+  className,
+  children,
+  title,
+  hint,
+  action,
+}: {
+  className?: string;
+  children: ReactNode;
+  title?: string;
+  hint?: string;
+  action?: ReactNode;
+}) {
   return (
     <section className={cn("panel reveal flex min-h-0 flex-col", className)}>
       {title && (
@@ -37,7 +49,15 @@ export function Row({ label, hint, children }: { label: string; hint?: string; c
   );
 }
 
-export function Toggle({ value, onChange, label }: { value: boolean; onChange: (v: boolean) => void; label?: string }) {
+export function Toggle({
+  value,
+  onChange,
+  label,
+}: {
+  value: boolean;
+  onChange: (v: boolean) => void;
+  label?: string;
+}) {
   return (
     <button
       role="switch"
@@ -45,32 +65,42 @@ export function Toggle({ value, onChange, label }: { value: boolean; onChange: (
       aria-label={label}
       onClick={() => onChange(!value)}
       className={cn(
-        "relative h-[22px] w-[40px] rounded-full transition-colors duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-pine-bright)]/50",
-        value ? "bg-[var(--color-pine)]" : "bg-[#cfd6e0]",
+        "relative h-[22px] w-[40px] rounded-full transition-colors duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#e5a93c]/50",
+        value ? "bg-[#e5a93c]" : "bg-[#2a2620]",
       )}
     >
       <span
         className={cn(
-          "absolute top-[2px] h-[18px] w-[18px] rounded-full bg-white shadow-[0_1px_3px_rgba(15,19,25,0.3)] transition-transform duration-200",
-          value ? "translate-x-[20px]" : "translate-x-[2px]",
+          "absolute top-[2px] h-[18px] w-[18px] rounded-full shadow-[0_1px_3px_rgba(0,0,0,0.6)] transition-transform duration-200",
+          value ? "translate-x-[20px] bg-[#0e0d0b]" : "translate-x-[2px] bg-[#9a9080]",
         )}
       />
     </button>
   );
 }
 
-export function Select<T extends string>({ value, onChange, options, className }: { value: T; onChange: (v: T) => void; options: { value: T; label: string }[]; className?: string }) {
+export function Select<T extends string>({
+  value,
+  onChange,
+  options,
+  className,
+}: {
+  value: T;
+  onChange: (v: T) => void;
+  options: { value: T; label: string }[];
+  className?: string;
+}) {
   return (
     <select
       value={value}
       onChange={(e) => onChange(e.target.value as T)}
       className={cn(
-        "rounded-lg border border-[var(--color-line)] bg-white px-2.5 py-1.5 text-[12px] font-500 text-[var(--color-ink-2)] outline-none transition-colors hover:border-[#c6ceda] focus:border-[var(--color-pine-bright)]",
+        "rounded-lg border border-[var(--color-line)] bg-[#14120f] px-2.5 py-1.5 text-[12px] font-500 text-[var(--color-ink-2)] outline-none transition-colors hover:border-[#3d362c] focus:border-[#e5a93c]",
         className,
       )}
     >
       {options.map((o) => (
-        <option key={o.value} value={o.value}>
+        <option key={o.value} value={o.value} className="bg-[#14120f] text-[var(--color-ink)]">
           {o.label}
         </option>
       ))}
@@ -96,15 +126,47 @@ export function TextField({
   multiline?: boolean;
 }) {
   const cls = cn(
-    "w-full rounded-lg border border-[var(--color-line)] bg-white px-3 py-2 text-[12.5px] text-[var(--color-ink)] placeholder:text-[var(--color-faint)] outline-none transition-all focus:border-[var(--color-pine-bright)] focus:shadow-[0_0_0_3px_rgba(15,156,138,0.12)]",
+    "w-full rounded-lg border border-[var(--color-line)] bg-[#12100d] px-3 py-2 text-[12.5px] text-[var(--color-ink)] placeholder:text-[var(--color-faint)] outline-none transition-all focus:border-[#e5a93c] focus:shadow-[0_0_0_3px_rgba(229,169,60,0.15)]",
     mono && "font-mono text-[11.5px]",
     className,
   );
-  if (multiline) return <textarea value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} className={cn(cls, "resize-none")} rows={3} />;
-  return <input value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} onKeyDown={onKeyDown} className={cls} />;
+  if (multiline) {
+    return (
+      <textarea
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        className={cn(cls, "resize-none")}
+        rows={3}
+      />
+    );
+  }
+  return (
+    <input
+      value={value}
+      placeholder={placeholder}
+      onChange={(e) => onChange(e.target.value)}
+      onKeyDown={onKeyDown}
+      className={cls}
+    />
+  );
 }
 
-export function NumberField({ value, onChange, min, max, step = 1, suffix }: { value: number; onChange: (v: number) => void; min?: number; max?: number; step?: number; suffix?: string }) {
+export function NumberField({
+  value,
+  onChange,
+  min,
+  max,
+  step = 1,
+  suffix,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  min?: number;
+  max?: number;
+  step?: number;
+  suffix?: string;
+}) {
   return (
     <div className="flex items-center gap-1.5">
       <input
@@ -114,14 +176,26 @@ export function NumberField({ value, onChange, min, max, step = 1, suffix }: { v
         max={max}
         step={step}
         onChange={(e) => onChange(Number(e.target.value))}
-        className="w-[86px] rounded-lg border border-[var(--color-line)] bg-white px-2 py-1.5 text-right font-mono text-[12px] tabular text-[var(--color-ink)] outline-none focus:border-[var(--color-pine-bright)]"
+        className="w-[86px] rounded-lg border border-[var(--color-line)] bg-[#12100d] px-2 py-1.5 text-right font-mono text-[12px] tabular text-[var(--color-ink)] outline-none focus:border-[#e5a93c]"
       />
       {suffix && <span className="font-mono text-[11px] text-[var(--color-muted)]">{suffix}</span>}
     </div>
   );
 }
 
-export function Slider({ value, onChange, min, max, step }: { value: number; onChange: (v: number) => void; min: number; max: number; step: number }) {
+export function Slider({
+  value,
+  onChange,
+  min,
+  max,
+  step,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  min: number;
+  max: number;
+  step: number;
+}) {
   return (
     <div className="flex items-center gap-2.5">
       <input
@@ -131,9 +205,11 @@ export function Slider({ value, onChange, min, max, step }: { value: number; onC
         max={max}
         step={step}
         onChange={(e) => onChange(Number(e.target.value))}
-        className="h-1.5 w-[132px] cursor-pointer appearance-none rounded-full bg-[#dfe4ec] accent-[var(--color-pine)]"
+        className="h-1.5 w-[132px] cursor-pointer appearance-none rounded-full bg-[#2a2620] accent-[#e5a93c]"
       />
-      <span className="w-9 text-right font-mono text-[11px] tabular text-[var(--color-muted)]">{value.toFixed(2)}</span>
+      <span className="w-9 text-right font-mono text-[11px] tabular text-[var(--color-muted)]">
+        {value.toFixed(2)}
+      </span>
     </div>
   );
 }
@@ -160,14 +236,22 @@ export function Button({
   type?: "button" | "submit";
 }) {
   const variants: Record<Variant, string> = {
-    default: "bg-white text-[var(--color-ink-2)] border-[var(--color-line)] hover:border-[#c2cad6] hover:bg-[var(--color-sunken)] shadow-[0_1px_2px_rgba(15,19,25,0.05)]",
-    primary: "bg-[var(--color-pine)] text-white border-[var(--color-pine)] hover:bg-[#0a5d53] shadow-[0_2px_8px_-2px_rgba(11,107,96,0.55)]",
-    danger: "bg-[var(--color-rose)] text-white border-[var(--color-rose)] hover:bg-[#96203a] shadow-[0_2px_8px_-2px_rgba(172,35,64,0.5)]",
-    warn: "bg-[var(--color-amber)] text-white border-[var(--color-amber)] hover:bg-[#93570a]",
-    outline: "bg-transparent text-[var(--color-ink-2)] border-[var(--color-line)] hover:bg-white",
-    ghost: "bg-transparent text-[var(--color-muted)] border-transparent hover:bg-[rgba(15,19,25,0.05)] hover:text-[var(--color-ink)]",
+    default:
+      "bg-[#1e1b17] text-[var(--color-ink-2)] border-[var(--color-line)] hover:border-[#3d372e] hover:bg-[#25211c] shadow-[0_1px_2px_rgba(0,0,0,0.4)]",
+    primary:
+      "bg-[#e5a93c] text-[#0e0d0b] font-600 border-[#e5a93c] hover:bg-[#f2be5c] shadow-[0_4px_14px_-3px_rgba(229,169,60,0.45)]",
+    danger:
+      "bg-[#e11d48] text-white border-[#e11d48] hover:bg-[#f43f5e] shadow-[0_2px_10px_-2px_rgba(225,29,72,0.5)]",
+    warn: "bg-[#d97706] text-[#0e0d0b] font-600 border-[#d97706] hover:bg-[#f59e0b]",
+    outline: "bg-transparent text-[var(--color-ink-2)] border-[var(--color-line)] hover:border-[#e5a93c]/50 hover:bg-[#1a1814]",
+    ghost:
+      "bg-transparent text-[var(--color-muted)] border-transparent hover:bg-[#1e1b17] hover:text-[var(--color-ink)]",
   };
-  const sizes = { xs: "px-2 py-1 text-[11px] rounded-md", sm: "px-2.5 py-1.5 text-[11.5px] rounded-lg", md: "px-3.5 py-2 text-[12.5px] rounded-lg" };
+  const sizes = {
+    xs: "px-2 py-1 text-[11px] rounded-md",
+    sm: "px-2.5 py-1.5 text-[11.5px] rounded-lg",
+    md: "px-3.5 py-2 text-[12.5px] rounded-lg",
+  };
   return (
     <button
       type={type}
@@ -175,7 +259,7 @@ export function Button({
       disabled={disabled}
       title={title}
       className={cn(
-        "inline-flex items-center justify-center gap-1.5 border font-500 transition-all duration-150 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 disabled:active:scale-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-pine-bright)]/40",
+        "inline-flex items-center justify-center gap-1.5 border font-500 transition-all duration-150 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 disabled:active:scale-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#e5a93c]/40",
         sizes[size],
         variants[variant],
         className,
@@ -186,20 +270,37 @@ export function Button({
   );
 }
 
-type Tone = "slate" | "green" | "amber" | "rose" | "pine" | "indigo";
+type Tone = "slate" | "green" | "amber" | "rose" | "pine" | "indigo" | "gold";
 
 const TONES: Record<Tone, string> = {
-  slate: "bg-[rgba(15,19,25,0.05)] text-[var(--color-muted)] ring-[rgba(15,19,25,0.08)]",
-  green: "bg-[var(--color-pine-wash)] text-[var(--color-pine)] ring-[rgba(11,107,96,0.18)]",
-  pine: "bg-[var(--color-pine-wash)] text-[var(--color-pine)] ring-[rgba(11,107,96,0.18)]",
-  amber: "bg-[var(--color-amber-wash)] text-[var(--color-amber)] ring-[rgba(169,101,10,0.2)]",
-  rose: "bg-[var(--color-rose-wash)] text-[var(--color-rose)] ring-[rgba(172,35,64,0.18)]",
-  indigo: "bg-[#e7ebfd] text-[var(--color-indigo-ink)] ring-[rgba(47,75,216,0.18)]",
+  slate: "bg-[#1e1b17] text-[var(--color-muted)] ring-[#2e2922]",
+  green: "bg-[rgba(45,212,191,0.12)] text-[#2dd4bf] ring-[rgba(45,212,191,0.28)]",
+  pine: "bg-[rgba(229,169,60,0.14)] text-[#e5a93c] ring-[rgba(229,169,60,0.3)]",
+  gold: "bg-[rgba(229,169,60,0.16)] text-[#f2be5c] ring-[rgba(229,169,60,0.34)]",
+  amber: "bg-[rgba(245,158,11,0.14)] text-[#fbbf24] ring-[rgba(245,158,11,0.28)]",
+  rose: "bg-[rgba(244,63,94,0.15)] text-[#fb7185] ring-[rgba(244,63,94,0.3)]",
+  indigo: "bg-[rgba(129,140,248,0.14)] text-[#a5b4fc] ring-[rgba(129,140,248,0.28)]",
 };
 
-export function Badge({ children, tone = "slate", className, dot }: { children: ReactNode; tone?: Tone; className?: string; dot?: boolean }) {
+export function Badge({
+  children,
+  tone = "slate",
+  className,
+  dot,
+}: {
+  children: ReactNode;
+  tone?: Tone;
+  className?: string;
+  dot?: boolean;
+}) {
   return (
-    <span className={cn("inline-flex items-center gap-1.5 rounded-full px-2 py-[3px] font-mono text-[10px] font-500 uppercase tracking-[0.06em] ring-1", TONES[tone], className)}>
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-full px-2.5 py-[3px] font-mono text-[10px] font-500 uppercase tracking-[0.06em] ring-1",
+        TONES[tone],
+        className,
+      )}
+    >
       {dot && <span className="h-1.5 w-1.5 rounded-full bg-current" />}
       {children}
     </span>
@@ -208,7 +309,7 @@ export function Badge({ children, tone = "slate", className, dot }: { children: 
 
 export function Kbd({ children }: { children: ReactNode }) {
   return (
-    <kbd className="rounded-[5px] border border-[var(--color-line)] border-b-2 bg-white px-1.5 py-[1px] font-mono text-[10px] font-500 text-[var(--color-ink-2)]">
+    <kbd className="rounded-[5px] border border-[var(--color-line)] border-b-2 bg-[#1a1814] px-1.5 py-[1px] font-mono text-[10px] font-500 text-[#e5a93c]">
       {children}
     </kbd>
   );
@@ -237,7 +338,20 @@ export function Stat({ label, value, tone = "slate" }: { label: string; value: R
   return (
     <div className="panel-flat px-3 py-2">
       <div className="label-xs">{label}</div>
-      <div className={cn("mt-1 font-mono text-[13px] font-500", tone === "green" ? "text-[var(--color-pine)]" : tone === "rose" ? "text-[var(--color-rose)]" : tone === "amber" ? "text-[var(--color-amber)]" : "text-[var(--color-ink)]")}>
+      <div
+        className={cn(
+          "mt-1 font-mono text-[13px] font-500",
+          tone === "green"
+            ? "text-[#2dd4bf]"
+            : tone === "rose"
+              ? "text-[#fb7185]"
+              : tone === "amber"
+                ? "text-[#fbbf24]"
+                : tone === "pine" || tone === "gold"
+                  ? "text-[#e5a93c]"
+                  : "text-[var(--color-ink)]",
+        )}
+      >
         {value}
       </div>
     </div>

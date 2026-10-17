@@ -116,6 +116,21 @@ test("protocol", "decision encoding and argv templating", (t) => {
   );
 });
 
+test("protocol", "Hermes CLI stream-json chunks parse into typed events", (t) => {
+  const sys = parseLine('{"type":"system","subtype":"init","model":"KRITI / 9Router","session_id":"s-100"}', "t1");
+  t.eq(sys.type, "streamSystem", "system init recognized");
+  t.eq(sys.model, "KRITI / 9Router", "model extracted");
+  const txt = parseLine('{"type":"text","text":"Checking OmniRoute combos..."}', "t1");
+  t.eq(txt.type, "streamText", "text chunk recognized");
+  t.eq(txt.text, "Checking OmniRoute combos...", "text preserved");
+  const tc = parseLine('{"type":"tool_call","name":"shell","arguments":{"cmd":"rm -rf /tmp/test"}}', "t1");
+  t.eq(tc.type, "streamToolCall", "tool_call recognized");
+  t.eq(tc.risk, "critical", "dangerous tool_call argument escalated to critical");
+  const res = parseLine('{"type":"result","text":"Done!","exit_code":0}', "t1");
+  t.eq(res.type, "streamResult", "result chunk recognized");
+  t.eq(res.exitCode, 0, "exit_code 0 extracted");
+});
+
 /* -------------------------------- redaction ------------------------------- */
 
 test("redaction", "known secret shapes are redacted", (t) => {
@@ -166,7 +181,13 @@ test("speechPrep", "markdown/code/urls stripped and long text summarized", (t) =
 
 test("speechPrep", "voice decisions map without guessing", (t) => {
   t.eq(mapVoiceDecision("haan kar do"), "allow", "haan=allow");
+  t.eq(mapVoiceDecision("permission di"), "allow", "permission di=allow");
+  t.eq(mapVoiceDecision("kar de"), "allow", "kar de=allow");
+  t.eq(mapVoiceDecision("theek hai"), "allow", "theek hai=allow");
+  t.eq(mapVoiceDecision("proceed"), "allow", "proceed=allow");
   t.eq(mapVoiceDecision("nahi"), "deny", "nahi=deny");
+  t.eq(mapVoiceDecision("nahi ruko"), "deny", "nahi ruko=deny");
+  t.eq(mapVoiceDecision("mat kar"), "deny", "mat kar=deny");
   t.eq(mapVoiceDecision("maybe later"), null, "ambiguous=null");
 });
 

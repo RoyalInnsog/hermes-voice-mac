@@ -27,14 +27,15 @@ export function summarizeForSpeech(input, maxChars = 320) {
   return `${out} Poori report overlay me hai.`;
 }
 
-const ALLOW = /\b(allow|yes|yep|haan|haa|ha|kar\s*do|theek|ok|okay|approve|allowed)\b/i;
-const DENY = /\b(deny|no|nope|nahi|na|mat|cancel|reject|stop)\b/i;
+const DENY = /\b(deny|no|nope|nahi|na|mat|mat\s+kar|ruk|ruko|nahi\s+ruko|cancel|reject|stop|rehne\s+do)\b/i;
+const ALLOW =
+  /\b(allow|yes|yep|haan|haa|ha|kar\s*do|kar\s*de|theek\s*hai|theek|permission\s*di|proceed|ok|okay|approve|allowed|chalo)\b/i;
 
 /** Voice decision mapping. Ambiguous input returns null — never guess. */
 export function mapVoiceDecision(text) {
   const s = String(text ?? "").toLowerCase().trim();
   if (!s) return null;
-  if (ALLOW.test(s)) return "allow";
   if (DENY.test(s)) return "deny";
+  if (ALLOW.test(s)) return "allow";
   return null;
 }
