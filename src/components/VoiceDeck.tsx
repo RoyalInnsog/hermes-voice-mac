@@ -334,6 +334,52 @@ export function VoiceDeck({
           )}
         </div>
 
+        {/* Dynamic Narration Mode Controls */}
+        <div className="mt-2.5 flex items-center justify-between rounded-xl border border-[var(--color-line-soft)] bg-black/25 px-2.5 py-1.5">
+          <span className="text-[11px] font-medium text-[var(--color-muted)]">Voice Updates:</span>
+          <div className="flex gap-1">
+            <button
+              type="button"
+              onClick={() => o.update("narrationMode", "verbose")}
+              className={cn(
+                "rounded px-2 py-0.5 text-[11px] font-medium transition-all",
+                (o.settings.narrationMode ?? "direct") === "verbose"
+                  ? "bg-[var(--color-gold)] text-black shadow-sm"
+                  : "text-[var(--color-ink-2)] hover:text-white hover:bg-white/5"
+              )}
+              title="Time-to-time: Speaks intermediate progress pings"
+            >
+              🔊 Time-to-time
+            </button>
+            <button
+              type="button"
+              onClick={() => o.update("narrationMode", "direct")}
+              className={cn(
+                "rounded px-2 py-0.5 text-[11px] font-medium transition-all",
+                (o.settings.narrationMode ?? "direct") === "direct"
+                  ? "bg-[var(--color-gold)] text-black shadow-sm"
+                  : "text-[var(--color-ink-2)] hover:text-white hover:bg-white/5"
+              )}
+              title="Direct: Mutes intermediate talk, speaks final result only"
+            >
+              🎯 Final Only
+            </button>
+            <button
+              type="button"
+              onClick={() => o.update("narrationMode", "on_demand")}
+              className={cn(
+                "rounded px-2 py-0.5 text-[11px] font-medium transition-all",
+                (o.settings.narrationMode ?? "direct") === "on_demand"
+                  ? "bg-[var(--color-gold)] text-black shadow-sm"
+                  : "text-[var(--color-ink-2)] hover:text-white hover:bg-white/5"
+              )}
+              title="On-Demand: Fully silent until you ask 'Ban gaya kya?'"
+            >
+              🤫 On-Demand
+            </button>
+          </div>
+        </div>
+
         <div className="mt-2.5 flex items-center justify-center gap-1.5 border-t border-[var(--color-line-soft)] pt-2.5">
           <span className="label-xs mr-1">talk</span>
           <Kbd>⌥</Kbd>

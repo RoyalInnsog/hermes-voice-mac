@@ -98,6 +98,8 @@ export interface Settings {
   ttsPitch: number;
   ttsVolume: number;
   speakProgress: boolean;
+  narrationMode: "verbose" | "direct" | "on_demand";
+  sttEngine: "webSpeech" | "whisper";
   confidenceThreshold: number;
   // Agent
   bridgeMode: BridgeMode;
@@ -134,6 +136,8 @@ export const DEFAULT_SETTINGS: Settings = {
   ttsPitch: 1,
   ttsVolume: 1,
   speakProgress: true,
+  narrationMode: "direct",
+  sttEngine: "whisper",
   confidenceThreshold: 0.6,
   bridgeMode: "local",
   bridgeURL: "http://127.0.0.1:20130",

@@ -107,3 +107,10 @@ else
 fi
 
 echo "✅ Built: $APP_DIR"
+
+if [[ -w "/Applications" ]]; then
+  echo "==> [5/5] Installing into /Applications/Hermes Voice.app..."
+  rm -rf "/Applications/Hermes Voice.app"
+  cp -R "$APP_DIR" "/Applications/Hermes Voice.app"
+  echo "✅ Installed: /Applications/Hermes Voice.app"
+fi

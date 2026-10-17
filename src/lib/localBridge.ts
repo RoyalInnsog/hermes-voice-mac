@@ -119,7 +119,7 @@ export class BridgeClient {
   async createTask(
     utterance: string,
     sessionId: string,
-  ): Promise<{ task: { id: string; sessionId: string; status: string; argv: string[] }; eventsUrl: string }> {
+  ): Promise<{ task: { id: string; sessionId: string; status: string; argv?: string[] }; eventsUrl?: string; replyText?: string; taskId?: string }> {
     return this.req("/api/tasks", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

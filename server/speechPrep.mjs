@@ -41,3 +41,28 @@ export function mapVoiceDecision(text) {
   if (isDeny) return "deny";
   return null;
 }
+
+const VERBOSE_RE = /\b(time\s*to\s*time|update\s*do|update\s*dete\s*raho|har\s*step|kitna\s*chal\s*raha\s*hai\s*bata|sab\s*batao|progress\s*update\s*on)\b/i;
+const DIRECT_RE = /\b(beech\s*me\s*mat\s*bol|chup\s*raho|chup\s*reh|sirf\s*last\s*me|direct\s*answer|last\s*me\s*bolna|update\s*mat\s*do|direct\s*mode)\b/i;
+const ON_DEMAND_RE = /\b(silent|poochu\s*tab|poochne\s*pe|apne\s*aap\s*mat\s*bolna|on\s*demand)\b/i;
+const STATUS_RE = /\b(ban\s*gaya\s*kya|ban\s*gaya|ho\s*gaya\s*kya|ho\s*gaya|kitna\s*kaam\s*hua|kya\s*status\s*hai|kya\s*chal\s*raha\s*hai|progress\s*batao|kuch\s*bana|kahan\s*tak\s*pahuncha)\b/i;
+
+/** Detects if user utterance is a command to change narration style or check progress */
+export function detectConversationalIntent(text) {
+  const s = String(text ?? "").trim();
+  if (!s) return null;
+  
+  if (VERBOSE_RE.test(s)) {
+    return { type: "modeChange", mode: "verbose", reply: "Theek hai, time-to-time progress updates deta rahunga." };
+  }
+  if (DIRECT_RE.test(s)) {
+    return { type: "modeChange", mode: "direct", reply: "Samajh gaya. Beech me update nahi bolunga, seedha final answer bataunga." };
+  }
+  if (ON_DEMAND_RE.test(s)) {
+    return { type: "modeChange", mode: "on_demand", reply: "Done, silent mode activate ho gaya. Jab aap poochoge 'ban gaya kya', tabhi bolunga." };
+  }
+  if (STATUS_RE.test(s)) {
+    return { type: "statusCheck" };
+  }
+  return null;
+}

@@ -16,7 +16,7 @@
 
 import http from "node:http";
 import { spawn, execFile } from "node:child_process";
-import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDirs, loadConfig, resolvePython, saveConfig, SCRATCH_DIR, TTS_CACHE_DIR, DATA_DIR } from "./config.mjs";
@@ -28,6 +28,7 @@ import * as store from "./store.mjs";
 import { cleanScratch } from "./store.mjs";
 import { EVENT_KINDS, MARKERS } from "./protocol.mjs";
 import { runServerTests } from "./selftest.mjs";
+import { detectConversationalIntent } from "./speechPrep.mjs";
 
 const VERSION = "1.0.0";
 const startedAt = Date.now();
@@ -363,6 +364,44 @@ export async function handleRequest(req, res) {
     /* -------------------------------- tasks ------------------------------- */
     if (m === "POST" && p === "/api/tasks") {
       const body = await readBody(req);
+      const text = String(body.utterance ?? "").trim();
+      
+      // Conversational intent check: mode change or progress inquiry
+      const intent = detectConversationalIntent(text);
+      if (intent?.type === "modeChange") {
+        config.hermes.narrationMode = intent.mode;
+        saveConfig({ hermes: { narrationMode: intent.mode } });
+        log.info("app", `narrationMode changed via voice to: ${intent.mode}`);
+        return send(res, 200, {
+          taskId: "intent-" + Date.now(),
+          mode: intent.mode,
+          replyText: intent.reply,
+          task: { status: "done", summary: intent.reply }
+        });
+      }
+      
+      if (intent?.type === "statusCheck") {
+        // Find latest active or recent task
+        const activeTasks = tasks.list();
+        const latest = activeTasks[0];
+        let statusMsg = "";
+        if (!latest) {
+          statusMsg = "Abhi koi task run nahi ho raha.";
+        } else if (latest.status === "running") {
+          statusMsg = `Kaam chal raha hai. Abhi tak ${latest.events?.length ?? 1} actions execute hue hain.`;
+        } else if (latest.status === "done") {
+          statusMsg = `Haan, task poora ho gaya! Summary: ${latest.summary || "Kaam complete ho gaya."}`;
+        } else {
+          statusMsg = `Task ${latest.status} hai.`;
+        }
+        return send(res, 200, {
+          taskId: "status-" + Date.now(),
+          isStatusCheck: true,
+          replyText: statusMsg,
+          task: { status: "done", summary: statusMsg }
+        });
+      }
+
       const task = await tasks.start({ utterance: body.utterance, sessionId: body.sessionId, meta: body.meta });
       log.info("agent", `task created ${task.id} for session ${task.sessionId}`);
       return send(res, 201, { taskId: task.id, task, eventsUrl: `/api/tasks/${task.id}/events` });
@@ -486,6 +525,35 @@ export async function handleRequest(req, res) {
           }
         };
       });
+    }
+
+    /* -------------------------- local faster-whisper STT -------------------- */
+    if (m === "POST" && p === "/api/stt/whisper") {
+      const body = await readBody(req);
+      let audioPath = body.audioPath;
+      if (body.audioBase64) {
+        const buf = Buffer.from(body.audioBase64, "base64");
+        audioPath = join(SCRATCH_DIR, `whisper-${Date.now()}.wav`);
+        writeFileSync(audioPath, buf);
+      }
+      if (!audioPath || !existsSync(audioPath)) {
+        return send(res, 400, { ok: false, error: "missingAudioFile" });
+      }
+      const pyBin = resolvePython();
+      const scriptPath = resolve(join(HERE, "..", "scripts", "local_whisper.py"));
+      execFile(pyBin, [scriptPath, "--audio", audioPath, "--model", "tiny", "--lang", body.lang ?? "auto"], { timeout: 15000 }, (err, stdout, stderr) => {
+        if (err) {
+          log.warn("stt", `whisper error: ${err.message}`);
+          return send(res, 500, { ok: false, error: "whisperFailed", detail: err.message });
+        }
+        try {
+          const result = JSON.parse(stdout);
+          return send(res, 200, result);
+        } catch {
+          return send(res, 200, { ok: true, text: stdout.trim() });
+        }
+      });
+      return;
     }
     const mediaMatch = p.match(/^\/api\/media\/([\w.-]+)$/);
     if (m === "GET" && mediaMatch) {

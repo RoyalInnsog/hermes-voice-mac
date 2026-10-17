@@ -159,9 +159,12 @@ export class TaskManager {
       this.#finish(task);
     });
 
-    // Mid-task spoken progress ping (>12s without stdout output while task is actively running)
+    // Mid-task spoken progress ping:
+    // If narrationMode is explicitly "direct" or "on_demand", skip automatic pings.
+    // If progressPingMs is configured and narrationMode is "verbose" (or not explicitly silenced), emit pings.
     const progressPingMs = Number(this.config.hermes?.progressPingMs ?? 12000);
-    if (progressPingMs > 0) {
+    const narrationMode = this.config.hermes?.narrationMode ?? "verbose";
+    if (progressPingMs > 0 && narrationMode !== "direct" && narrationMode !== "on_demand") {
       const checkEvery = Math.min(1000, Math.max(100, Math.floor(progressPingMs / 3)));
       task.pingInterval = setInterval(async () => {
         if (task.status !== "running" || task.finishedAt) return;
